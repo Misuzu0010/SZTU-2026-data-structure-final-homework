@@ -1,0 +1,7 @@
+/day1/
+
+# StarRing 本轮只提交第六轮迭代记录，其余内容保留在本地。
+/StarRing/*
+!/StarRing/docs/
+/StarRing/docs/*
+!/StarRing/docs/第六轮迭代记录.md

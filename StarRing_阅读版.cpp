@@ -1,761 +1,1734 @@
 #include <bits/stdc++.h>
 #pragma GCC optimize("O3,unroll-loops")
-using i64=long long;
+using i64 = long long;
 using namespace std;
-struct Net {
-    
-    int block=0; // 每个机房的节点数
-    vector<int> node; // 每个机架接入的网络节点
+
+struct network_state {
+
+    int nodes_per_datacenter = 0; // 每个机房的节点数
+    vector<int> rack_nodes; // 每个机架接入的网络节点
     vector<i64> edges; // 在线链路存非负时延，离线时按位取反，按输入顺序编号
-    vector<vector<pair<int,int>>> g; // 邻接表，每项为邻点和链路编号
-    vector<unsigned char> online; // 节点是否通电
-    array<array<i64,30>,30> route; // 机架间距离，-2 未算，-1 不可达
-    vector<i64> best; // Dijkstra 复用的节点距离表
-    vector<pair<i64,int>> heap; // Dijkstra 复用的小根堆
-    vector<unsigned char> target; // 网络节点是否连接至少一个机架
-    void init(int nodes,int d,int racks){
-        block=nodes/d;node.resize(racks);g.resize(nodes);online.assign(nodes,1);
-        best.resize(nodes);target.assign(nodes,0);invalidate();
+    vector<vector<pair<int, int>>> adjacency; // 邻接表，每项为邻点和链路编号
+    vector<unsigned char> node_online; // 节点是否通电
+    array<array<i64, 30>, 30> distance_cache; // 机架间距离，-2 未算，-1 不可达
+    vector<i64> distances; // Dijkstra 复用的节点距离表
+    vector<pair<i64, int>> distance_heap; // Dijkstra 复用的小根堆
+    vector<unsigned char> target_nodes; // 网络节点是否连接至少一个机架
+
+    void initialize(int node_count, int datacenter_count, int rack_count) {
+        nodes_per_datacenter = node_count / datacenter_count;
+        rack_nodes.resize(rack_count);
+        adjacency.resize(node_count);
+        node_online.assign(node_count, 1);
+        distances.resize(node_count);
+        target_nodes.assign(node_count, 0);
+        clear_distances();
     }
-    void edge(int u,int v,i64 w){int i=edges.size();edges.push_back(w);g[u].emplace_back(v,i);g[v].emplace_back(u,i);}
-    void invalidate(){for(auto& row:route)row.fill(-2);}
-    void setDC(int d,bool up){int l=d*block;if(online[l]!=up){fill(online.begin()+l,online.begin()+l+block,up);invalidate();}}
-    void setLink(int e,bool up){if((edges[e]>=0)!=up){edges[e]=~edges[e];invalidate();}}
-    i64 dist(int a,int b){
-        i64& cached=route[a][b];return cached==-2?cached=rebuild(a,b):cached;
+
+    void add_link(int from_node, int to_node, i64 latency) {
+        int link_id = edges.size();
+        edges.push_back(latency);
+        adjacency[from_node].emplace_back(to_node, link_id);
+        adjacency[to_node].emplace_back(from_node, link_id);
     }
-    i64 rebuild(int a,int b){
-        int s=node[a],targetNode=node[b];if(!online[s]||!online[targetNode])return -1;if(s==targetNode)return 0;
-        fill(target.begin(),target.end(),0);int left=0;
-        for(int u:node)if(!target[u]){target[u]=1;left+=online[u];}
-        fill(best.begin(),best.end(),-1);best[s]=0;heap.clear();heap.emplace_back(0,s);
-        while(!heap.empty()){
-            pop_heap(heap.begin(),heap.end());auto [ds,u]=heap.back();ds=-ds;heap.pop_back();if(ds!=best[u])continue;
-            if(target[u]&&!--left)break;
-            for(auto [v,e]:g[u])if(online[v]&&edges[e]>=0&&ds<=numeric_limits<i64>::max()-edges[e]){
-                i64 dd=ds+edges[e];if(best[v]<0||dd<best[v]){best[v]=dd;heap.emplace_back(-dd,v);push_heap(heap.begin(),heap.end());}
-            }
+
+    void clear_distances() {
+        for (auto& row : distance_cache)
+            row.fill(-2);
+    }
+
+    void set_datacenter_online(int datacenter_id, bool is_online) {
+        int first_node = datacenter_id * nodes_per_datacenter;
+        if (node_online[first_node] != is_online) {
+            fill(node_online.begin() + first_node,
+                 node_online.begin() + first_node + nodes_per_datacenter, is_online);
+            clear_distances();
         }
-        for(size_t r=0;r<node.size();++r)route[r][a]=route[a][r]=best[node[r]];
-        return route[a][b];
+    }
+
+    void set_link_online(int link_id, bool is_online) {
+        if ((edges[link_id] >= 0) != is_online) {
+            edges[link_id] = ~edges[link_id];
+            clear_distances();
+        }
+    }
+
+    i64 distance(int from_rack, int to_rack) {
+        i64& cached = distance_cache[from_rack][to_rack];
+        return cached == -2 ? cached = compute_distances(from_rack, to_rack) : cached;
+    }
+
+    i64 compute_distances(int from_rack, int to_rack) {
+        int source_node = rack_nodes[from_rack], destination_node = rack_nodes[to_rack];
+        if (!node_online[source_node] || !node_online[destination_node])
+            return -1;
+        if (source_node == destination_node)
+            return 0;
+        fill(target_nodes.begin(), target_nodes.end(), 0);
+        int targets_left = 0;
+        for (int node_id : rack_nodes)
+            if (!target_nodes[node_id]) {
+                target_nodes[node_id] = 1;
+                targets_left += node_online[node_id];
+            }
+        fill(distances.begin(), distances.end(), -1);
+        distances[source_node] = 0;
+        distance_heap.clear();
+        distance_heap.emplace_back(0, source_node);
+        while (!distance_heap.empty()) {
+            pop_heap(distance_heap.begin(), distance_heap.end());
+            auto [distance_so_far, node_id] = distance_heap.back();
+            distance_so_far = -distance_so_far;
+            distance_heap.pop_back();
+            if (distance_so_far != distances[node_id])
+                continue;
+            if (target_nodes[node_id] && !--targets_left)
+                break;
+            for (auto [neighbor_id, link_id] : adjacency[node_id])
+                if (node_online[neighbor_id] && edges[link_id] >= 0 &&
+                    distance_so_far <= numeric_limits<i64>::max() - edges[link_id]) {
+                    i64 next_distance = distance_so_far + edges[link_id];
+                    if (distances[neighbor_id] < 0 || next_distance < distances[neighbor_id]) {
+                        distances[neighbor_id] = next_distance;
+                        distance_heap.emplace_back(-next_distance, neighbor_id);
+                        push_heap(distance_heap.begin(), distance_heap.end());
+                    }
+                }
+        }
+        for (size_t rack_id = 0; rack_id < rack_nodes.size(); ++rack_id)
+            distance_cache[rack_id][from_rack] = distance_cache[from_rack][rack_id] =
+                distances[rack_nodes[rack_id]];
+        return distance_cache[from_rack][to_rack];
     }
 };
 
-struct Cache {
-    static const int S=400; // 循环链表的哨兵编号，也是镜像层数上限
-    inline static long long size[S]{}; // 各镜像层的大小，所有缓存共用
-    long long cap=0,used=0; // 容量与当前占用量
-    array<short,S+1> prv{},nxt{}; // 层的前驱、后继；前驱为 -1 表示不存在
-    Cache(){clear();}
-    bool has(int l){return prv[l]>=0;}
-    void clear(){prv.fill(-1);prv[S]=nxt[S]=S;used=0;}
-    void unlink(int l){nxt[prv[l]]=nxt[l];prv[nxt[l]]=prv[l];prv[l]=-1;}
-    void touch(int l){
-        if(has(l)){if(nxt[l]==S)return;unlink(l);}
-        else{
-            if(size[l]>cap){if(nxt[S]!=S)clear();return;}
-            while(used>cap-size[l]){int u=nxt[S];used-=size[u];unlink(u);}
-            used+=size[l];
+struct layer_cache {
+    static const int sentinel = 400; // 循环链表的哨兵编号，也是镜像层数上限
+    inline static long long layer_sizes[sentinel]{}; // 各镜像层的大小，所有缓存共用
+    long long capacity = 0, used_bytes = 0; // 容量与当前占用量
+    array<short, sentinel + 1> previous_layer{},
+        next_layer{}; // 层的前驱、后继；前驱为 -1 表示不存在
+
+    layer_cache() {
+        clear();
+    }
+
+    bool contains(int layer_id) {
+        return previous_layer[layer_id] >= 0;
+    }
+
+    void clear() {
+        previous_layer.fill(-1);
+        previous_layer[sentinel] = next_layer[sentinel] = sentinel;
+        used_bytes = 0;
+    }
+
+    void unlink_layer(int layer_id) {
+        next_layer[previous_layer[layer_id]] = next_layer[layer_id];
+        previous_layer[next_layer[layer_id]] = previous_layer[layer_id];
+        previous_layer[layer_id] = -1;
+    }
+
+    void touch_layer(int layer_id) {
+        if (contains(layer_id)) {
+            if (next_layer[layer_id] == sentinel)
+                return;
+            unlink_layer(layer_id);
+        } else {
+            if (layer_sizes[layer_id] > capacity) {
+                if (next_layer[sentinel] != sentinel)
+                    clear();
+                return;
+            }
+            while (used_bytes > capacity - layer_sizes[layer_id]) {
+                int oldest_layer = next_layer[sentinel];
+                used_bytes -= layer_sizes[oldest_layer];
+                unlink_layer(oldest_layer);
+            }
+            used_bytes += layer_sizes[layer_id];
         }
-        prv[l]=prv[S];nxt[l]=S;nxt[prv[S]]=l;prv[S]=l;
+        previous_layer[layer_id] = previous_layer[sentinel];
+        next_layer[layer_id] = sentinel;
+        next_layer[previous_layer[sentinel]] = layer_id;
+        previous_layer[sentinel] = layer_id;
     }
 };
-struct Pull { long long reg,rack; }; // 仓库与机架的拉取量
-inline Pull pull(Cache& m,Cache& r, vector<int>& layers){
-    Pull q{};for(int l:layers){if(!m.has(l)){(r.has(l)?q.rack:q.reg)+=Cache::size[l];r.touch(l);}m.touch(l);}return q;
+
+struct pull_amounts {
+    long long registry_bytes, rack_bytes;
+}; // 仓库与机架的拉取量
+
+inline pull_amounts pull_image_layers(layer_cache& machine_cache, layer_cache& rack_cache,
+                                      vector<int>& layers) {
+    pull_amounts amounts{};
+    for (int layer_id : layers) {
+        if (!machine_cache.contains(layer_id)) {
+            (rack_cache.contains(layer_id) ? amounts.rack_bytes : amounts.registry_bytes) +=
+                layer_cache::layer_sizes[layer_id];
+            rack_cache.touch_layer(layer_id);
+        }
+        machine_cache.touch_layer(layer_id);
+    }
+    return amounts;
 }
-inline Pull preview( Cache& m, Cache& r, vector<int>& layers){
-    for(int l:layers)if(!m.has(l)){Cache mc=m,rc=r;return pull(mc,rc,layers);}
+
+inline pull_amounts preview_image_pull(layer_cache& machine_cache, layer_cache& rack_cache,
+                                       vector<int>& layers) {
+    for (int layer_id : layers)
+        if (!machine_cache.contains(layer_id)) {
+            layer_cache machine_copy = machine_cache, rack_copy = rack_cache;
+            return pull_image_layers(machine_copy, rack_copy, layers);
+        }
     return {};
 }
 
-struct Logs {
-    
-    struct ACNode {
-        array<int,8> go{}; // 字母转移，构建后补全失败转移
-        i64 sum=0; // 在该状态结尾的所有告警模式的权重和
-        i64 peak=0; // 构建前为最高单模式权重，构建后为是否达到固定告警阈值
+struct log_tracker {
+
+    struct pattern_node {
+        array<int, 8> next_state{}; // 字母转移，构建后补全失败转移
+        i64 weight_sum = 0; // 在该状态结尾的所有告警模式的权重和
+        i64 high_weight_match = 0; // 构建前为最高单模式权重，构建后为是否达到固定告警阈值
     };
-    vector<ACNode> ac{1}; // 告警模式的 AC 自动机，0 是根
-    array<array<uint64_t,256>,17> decode{}; // 低32位为加一后的四位符号流，高位为赫夫曼终态
-    array<array<int,2>,17> child{}; // 赫夫曼树的左右子结点
-    int slot=0; // 本 tick 对应的窗口桶
-    vector<i64> value; // 每台机器当前窗口的告警值
+
+    vector<pattern_node> patterns{1}; // 告警模式的 AC 自动机，0 是根
+    array<array<uint64_t, 256>, 17> decode_table{}; // 低32位为加一后的四位符号流，高位为赫夫曼终态
+    array<array<int, 2>, 17> huffman_children{}; // 赫夫曼树的左右子结点
+    int window_slot = 0; // 本 tick 对应的窗口桶
+    vector<i64> alarm_scores; // 每台机器当前窗口的告警值
     vector<vector<i64>> window; // 按 tick 取模记录每台机器的告警分
-    void init(int machines,int w, array<i64,9>& freq){
-        value.assign(machines,0);window.assign(w,vector<i64>(machines));
-        using Q=pair<i64,int>;priority_queue<Q,vector<Q>,greater<Q>> q;
-        for(int i=0;i<9;++i)q.emplace(freq[i],i);
-        for(int i=9;i<17;++i){auto [a,l]=q.top();q.pop();auto [b,r]=q.top();q.pop();child[i]={l,r};q.emplace(a+b,i);}
-        for(int u=9;u<17;++u)for(int h=0;h<256;++h){
-            auto& s=decode[u][h];int a=u,n=0;
-            for(int i=7;i>=0;--i){a=child[a][h>>i&1];if(a<9){s|=uint64_t(a+1)<<(4*n++);a=16;}}s|=uint64_t(a)<<32;
+
+    void initialize(int machine_count, int window_size, array<i64, 9>& frequencies) {
+        alarm_scores.assign(machine_count, 0);
+        window.assign(window_size, vector<i64>(machine_count));
+        using heap_entry = pair<i64, int>;
+        priority_queue<heap_entry, vector<heap_entry>, greater<heap_entry>> frequency_heap;
+        for (int index = 0; index < 9; ++index)
+            frequency_heap.emplace(frequencies[index], index);
+        for (int index = 9; index < 17; ++index) {
+            auto [left_weight, left_child] = frequency_heap.top();
+            frequency_heap.pop();
+            auto [right_weight, right_child] = frequency_heap.top();
+            frequency_heap.pop();
+            huffman_children[index] = {left_child, right_child};
+            frequency_heap.emplace(left_weight + right_weight, index);
+        }
+        for (int start_node = 9; start_node < 17; ++start_node)
+            for (int byte_value = 0; byte_value < 256; ++byte_value) {
+                auto& entry = decode_table[start_node][byte_value];
+                int state = start_node, symbol_count = 0;
+                for (int index = 7; index >= 0; --index) {
+                    state = huffman_children[state][byte_value >> index & 1];
+                    if (state < 9) {
+                        entry |= uint64_t(state + 1) << (4 * symbol_count++);
+                        state = 16;
+                    }
+                }
+                entry |= uint64_t(state) << 32;
+            }
+    }
+
+    void add_pattern(string& pattern_text, i64 weight) {
+        int state = 0;
+        for (char letter : pattern_text) {
+            int symbol = letter - 'a', next = patterns[state].next_state[symbol];
+            if (!next) {
+                next = patterns.size();
+                patterns[state].next_state[symbol] = next;
+                patterns.emplace_back();
+            }
+            state = next;
+        }
+        patterns[state].weight_sum += weight;
+        patterns[state].high_weight_match = max(patterns[state].high_weight_match, weight);
+    }
+
+    void build_matcher(i64 threshold) {
+        vector<int> failure_links(patterns.size()), order;
+        order.reserve(patterns.size());
+        for (int next : patterns[0].next_state)
+            if (next)
+                order.push_back(next);
+        for (size_t index = 0; index < order.size(); ++index) {
+            int state = order[index], fallback = failure_links[state];
+            patterns[state].weight_sum += patterns[fallback].weight_sum;
+            patterns[state].high_weight_match = patterns[state].high_weight_match >= threshold ||
+                                                patterns[fallback].high_weight_match;
+            for (int symbol = 0; symbol < 8; ++symbol) {
+                int& next = patterns[state].next_state[symbol];
+                if (next) {
+                    failure_links[next] = patterns[fallback].next_state[symbol];
+                    order.push_back(next);
+                } else
+                    next = patterns[fallback].next_state[symbol];
+            }
         }
     }
-    void pattern( string& s,i64 w){
-        int u=0;for(char c:s){int j=c-'a',v=ac[u].go[j];if(!v){v=ac.size();ac[u].go[j]=v;ac.emplace_back();}u=v;}ac[u].sum+=w;ac[u].peak=max(ac[u].peak,w);
-    }
-    void build(i64 threshold){
-        vector<int> fail(ac.size()),order;order.reserve(ac.size());
-        for(int v:ac[0].go)if(v)order.push_back(v);
-        for(size_t i=0;i<order.size();++i){
-            int u=order[i],f=fail[u];ac[u].sum+=ac[f].sum;ac[u].peak=ac[u].peak>=threshold||ac[f].peak;
-            for(int j=0;j<8;++j){int& v=ac[u].go[j];if(v){fail[v]=ac[f].go[j];order.push_back(v);}else v=ac[f].go[j];}
+
+    void advance_window(int tick) {
+        window_slot = tick % (int)window.size();
+        auto& row = window[window_slot];
+        for (size_t machine_id = 0; machine_id < row.size(); ++machine_id) {
+            alarm_scores[machine_id] -= row[machine_id];
+            row[machine_id] = 0;
         }
     }
-    void tick(int t){slot=t%(int)window.size();auto& row=window[slot];for(size_t x=0;x<row.size();++x){value[x]-=row[x];row[x]=0;}}
-    static int hex(char h){return h<='9'?h-'0':(h|32)-'a'+10;}
-    i64 add(int x,int bits, string& h){
-        int ht=16,u=0,i=0;i64 score=0;bool lastWeight=0;
-        auto feed=[&](int a){if(a==8)u=0;else{u=ac[u].go[a];score+=ac[u].sum;lastWeight|=ac[u].peak;}};
-        for(;bits>=8;bits-=8,i+=2){
-            auto s=decode[ht][hex(h[i])*16+hex(h[i+1])];ht=s>>32;
-            for(unsigned v=s;v;v>>=4)feed((v&15)-1);
+
+    static int hex_digit(char digit) {
+        return digit <= '9' ? digit - '0' : (digit | 32) - 'a' + 10;
+    }
+
+    i64 add_log(int machine_id, int bit_count, string& hex_text) {
+        int decode_state = 16, match_state = 0, hex_offset = 0;
+        i64 score = 0;
+        bool has_high_weight = 0;
+        auto feed = [&](int symbol) {
+            if (symbol == 8)
+                match_state = 0;
+            else {
+                match_state = patterns[match_state].next_state[symbol];
+                score += patterns[match_state].weight_sum;
+                has_high_weight |= patterns[match_state].high_weight_match;
+            }
+        };
+        for (; bit_count >= 8; bit_count -= 8, hex_offset += 2) {
+            auto entry = decode_table[decode_state][hex_digit(hex_text[hex_offset]) * 16 +
+                                                    hex_digit(hex_text[hex_offset + 1])];
+            decode_state = entry >> 32;
+            for (unsigned symbols = entry; symbols; symbols >>= 4)
+                feed((symbols & 15) - 1);
         }
-        for(int k=0;k<bits;++k){ht=child[ht][hex(h[i+k/4])>>(3-k%4)&1];if(ht<9){feed(ht);ht=16;}}
-        window[slot][x]+=score;value[x]+=score;return lastWeight;
+        for (int bit_index = 0; bit_index < bit_count; ++bit_index) {
+            decode_state =
+                huffman_children[decode_state][hex_digit(hex_text[hex_offset + bit_index / 4]) >>
+                                                   (3 - bit_index % 4) &
+                                               1];
+            if (decode_state < 9) {
+                feed(decode_state);
+                decode_state = 16;
+            }
+        }
+        window[window_slot][machine_id] += score;
+        alarm_scores[machine_id] += score;
+        return has_high_weight;
     }
 };
+
 #include <unistd.h>
 
+using i128 = __int128_t;
+const int command_limit = 20000;
 
-using i128=__int128_t;
-const int LIM=20000;
-static i64 divup(i64 n,i64 d){return n<d?(n!=0):n/d+(n%d!=0);}
+static i64 ceil_div(i64 numerator, i64 denominator) {
+    return numerator < denominator ? (numerator != 0)
+                                   : numerator / denominator + (numerator % denominator != 0);
+}
 
-struct IO{
-    char buf[1<<16]; int at,end; // 管道输入块与读写位置
-    string out; // 当前 tick 的完整回复
-    int ch(){
-        if(at==end){
-            end=::read(0,buf,sizeof buf);
-            at=0;
+struct buffered_io {
+    char input_buffer[1 << 16];
+    int input_offset, input_size; // 管道输入块与读写位置
+    string output_buffer; // 当前 tick 的完整回复
+
+    int read_char() {
+        if (input_offset == input_size) {
+            input_size = ::read(0, input_buffer, sizeof input_buffer);
+            input_offset = 0;
         }
-        return buf[at++];
+        return input_buffer[input_offset++];
     }
-    int first(){int c;do c=ch();while(c<=32);return c;}
-    void word(string& s){s.clear();int c=first();for(;c>32;c=ch())s+=c;}
-    i64 num(){int c=first();bool neg=c=='-';if(neg)c=ch();uint64_t v=0;for(;c>32;c=ch())v=v*10+c-'0';return neg?-v:v;}
-    template<class T>void put(T x){
-        char s[48];int n=0;if(x<0){out+='-';x=-x;}
-        do{s[n++]='0'+x%10;x/=10;}while(x);
-        while(n)out+=s[--n];
+
+    int skip_whitespace() {
+        int character;
+        do
+            character = read_char();
+        while (character <= 32);
+        return character;
     }
-    void flush(){out+="END\n";fwrite(out.data(),1,out.size(),stdout);fflush(stdout);out.clear();}
+
+    void read_word(string& word) {
+        word.clear();
+        int character = skip_whitespace();
+        for (; character > 32; character = read_char())
+            word += character;
+    }
+
+    i64 read_int() {
+        int character = skip_whitespace();
+        bool is_negative = character == '-';
+        if (is_negative)
+            character = read_char();
+        uint64_t value = 0;
+        for (; character > 32; character = read_char())
+            value = value * 10 + character - '0';
+        return is_negative ? -value : value;
+    }
+
+    template <class value_type>
+    void write_int(value_type value) {
+        char digits[48];
+        int digit_count = 0;
+        if (value < 0) {
+            output_buffer += '-';
+            value = -value;
+        }
+        do {
+            digits[digit_count++] = '0' + value % 10;
+            value /= 10;
+        } while (value);
+        while (digit_count)
+            output_buffer += digits[--digit_count];
+    }
+
+    void flush() {
+        output_buffer += "END\n";
+        fwrite(output_buffer.data(), 1, output_buffer.size(), stdout);
+        fflush(stdout);
+        output_buffer.clear();
+    }
 } io;
 
-struct Tenant{
-    int parent=-1,seen; // 父租户、真实时长样本数
-    i64 quota,used; // 配额、子树已用核数
-    i128 bill,rate; // 仿射账单常数、子树每 tick 运行费
-    double observed,bias=1.2; // 时长倍率样本和、本轮预测倍率
-    vector<int> path; // 从本租户到根的路径
-};
-struct Machine{
-    int rack,alert=-100,lastFail=-100; // 所在机架、最近高权重告警和故障的 tick
-    i64 cpu,mem; // 当前空闲核数和内存
-    i64 totalCPU,totalMEM; // 单机总容量，用于判断作业是否永久无处运行
-    bool up=1; // 是否正常
-    Cache cache; // 机器层缓存
-    vector<int> run; // 运行中作业的下标
-};
-struct Rack{
-    int dc; // 所在机房
-    Cache cache; // 机架层缓存
-};
-struct Image{
-    vector<int> layer; // 从底到顶的镜像层
-    i64 bytes; // 镜像层大小之和
-    array<int,3> sample{}; // 粗筛机器时查看的三层
-};
-struct Input{
-    i64 bytes,serial; // 同源输入的总大小、最长串行传输耗时
-    int rack; // 输入源机架
+struct tenant_state {
+    int parent_id = -1, sample_count; // 父租户、真实时长样本数
+    i64 quota, used_cores; // 配额、子树已用核数
+    i128 bill_offset, billing_rate; // 仿射账单常数、子树每 tick 运行费
+    double duration_ratio_sum, duration_factor = 1.2; // 时长倍率样本和、本轮预测倍率
+    vector<int> ancestor_path; // 从本租户到根的路径
 };
 
-struct Job{
-    int id,w,img,src=-1; // 外部编号、所属工作流、镜像、外部输入机架
-    int pb,pe,sb,se,need; // 前驱和后继的半开区间、未完成前驱数
-    int pos=-1,x=-1,start; // 就绪/运行表位置、机器、输出机架、启动 tick
-    int retry=-1; // 未投入工作流上次放置失败时的环境版本
-    unsigned state:2,fit:30; // 作业状态、已证在线可容纳的机架位集
-    i64 cpu,mem,e,zin,zout; // 核数、内存、估计时长、输入大小、输出大小
-    i64 tail,rough,es,prep; // 精确尾长、含准备的预测尾长、最早起点、实际准备时长
-    vector<Input> delivered; // 已完成前驱按实际机架累计的字节数与最长串行传输期
-    double future=-1,charge; // 计划中的后继关键路径、当前作业的预估剩余费用
-    uint64_t planPred,knownPred; // 静态约简前驱、原前驱列表中正在运行的位集
+struct machine_state {
+    int rack_id, last_alert_tick = -100,
+                 last_failure_tick = -100; // 所在机架、最近高权重告警和故障的 tick
+    i64 free_cores, free_memory; // 当前空闲核数和内存
+    i64 total_cores, total_memory; // 单机总容量，用于判断作业是否永久无处运行
+    bool online = 1; // 是否正常
+    layer_cache cache; // 机器层缓存
+    vector<int> running_jobs; // 运行中作业的下标
 };
-struct Flow{
-    i64 largest; // 未完成作业最大核数，负值表示完成事件后需要重算
-    int owner,lo,hi,dl,grace,latest,finished; // 租户、作业区间、截止、宽限、最后可收益 tick、完成数
-    int audited=-1,stamp; // 最后完成 tick、松弛缓存版本、预测版本
-    i64 value,cp,cores; // 初始价值、审计关键路径、未完成作业的核数和
-    double work,critical,burn,remain,cost,rank; // 剩余估计核时、临界路径、运行中预计核时、完工估时、预计费用、优先级
-    bool started; // 是否已投入资源
-    int rescueAt=-1; // 本流程最近一次尝试救急重选的 tick
-    int anchor=-1,planned=-100,planChange=-1; // 计划锚定机架、计划tick、完成状态版本
-    double planCost,planSpan; // 整个未完成部分的预计费用、关键路径
-    int exactTick=-1,exactEnvironment=-1; // 最后完整恢复的精确规划对应 tick 与环境版本
-};
-struct WarmHint{
-    int stamp=-1; // 估价对应的七 tick 规划周期
-    int machine; // 同时考虑拉取费与准备耗时后选中的机器
-    Pull pull; // 同一台机器预计从仓库和机架拉取的字节数
-};
-struct Route{
-    i64 time=-1; i128 fee; // 传输耗时（负数不可达）、传输费
-};
-using Candidate=pair<double,int>; // 负优先级与作业下标，或机器粗排分与机器下标
 
-struct Solver{
-    int T,D,N,R,M,K,L,I,P,W,E; // 初始化规模，含 tick 总数
-    int t,commands,seen; // 当前 tick、指令数、完成样本数
-    int rescues; // 本 tick 的救急重选次数，限制最坏规模规划开销
-    int environment; // 会改变资源、缓存、估时或冷启动协作机会的环境版本
-    bool invested; // 本 tick 是否已为共享镜像做过一次冷启动投资
-    bool fitDirty; // 本 tick 有机器故障，需要在规划前清除容量正命中
-    i64 Breg,Brack,Bnet,Ureg,Unet,maxWeight; // 带宽、费用、最大告警模式权重
-    i64 minPrice; // 全场最低 CPU 单价
-    double observed; // 全场真实时长倍率样本和
-    vector<i64> price; // 机房 CPU 单价
-    vector<Rack> racks; vector<Machine> machines; // 机架和机器状态
-    vector<Tenant> tenants; vector<Image> images; // 租户和镜像
-    vector<pair<int,i64>> undo; // 配额的撤销记录
-    vector<Job> jobs; vector<Flow> flows; // 按工作流连续存放的作业、工作流
-    vector<int> pred,succ,ready,live,touched; // 前驱、后继、就绪表、在线机器、待更新的工作流
-    vector<i64> headroom,limit; // 本轮的租户路径剩余配额与总配额
-    vector<Candidate> queue; // 候选优先级
-    double stage[2][40],charges[2][40]; // 规划双缓冲：当前试算和胜出方案的阶段耗时、费用
-    int scratch=0; // 正在写入的规划槽
-    using Snapshot=array<pair<double,double>,40>; // 单条可调度工作流的后继尾长与作业费用缓冲区
-    vector<vector<int>> rackMachines; // 各机架机器下标
-    vector<double> committed; // 各租户子树已接纳工作流的剩余占核时
-    array<i64,30> rackCPU{},rackMEM{}; // 每机架在本轮开始时的最大单机空闲资源
-    array<double,30> rackDebt{},inverseCores; // 机架的剩余核时、有效在线核数倒数
-    array<i64,30> rackCores{},maxCPU{},maxMEM{}; // 机架在线总核数、单机额定资源上界
-    array<int,30> representative; // 每机架的代表缓存机器，按 tick 重建
-    unordered_map<int,int> jid{65536}; // 开放寻址表将九位作业编号映射到连续下标
-    vector<WarmHint> warmHints; // 按机架与镜像缓存本轮乐观暖度
-    Net net; Logs logs; // 动态最短路和告警统计
-    string op,token; // 协议关键字与临时字符串
-    static bool fits( Machine& m, Job& j){return m.totalCPU>=j.cpu&&m.totalMEM>=j.mem;}
+struct rack_state {
+    int datacenter_id; // 所在机房
+    layer_cache cache; // 机架层缓存
+};
 
-    void init(){
-        T=io.num();
-        D=io.num();N=io.num();R=io.num();M=io.num();K=io.num();L=io.num();I=io.num();P=io.num();W=io.num();E=io.num();
-        Breg=io.num();Brack=io.num();Bnet=io.num();Ureg=io.num();Unet=io.num();
-        price.resize(D);for(auto& p:price)p=io.num();minPrice=*min_element(price.begin(),price.end());
-        net.init(N,D,R);racks.resize(R);machines.resize(M);tenants.resize(K);images.resize(I);
-        for(int r=0;r<R;++r){racks[r].dc=io.num();net.node[r]=io.num();racks[r].cache.cap=io.num();}
-        for(auto& x:machines){x.rack=io.num();x.cpu=x.totalCPU=io.num();x.mem=x.totalMEM=io.num();x.cache.cap=io.num();}
-        for(int e=0;e<E;++e){int u=io.num(),v=io.num();i64 w=io.num();net.edge(u,v,w);}
-        for(auto& a:tenants){a.parent=io.num();a.quota=io.num();}
-        for(int a=0;a<K;++a)for(int u=a;u>=0;u=tenants[u].parent)tenants[a].path.push_back(u);
-        for(int l=0;l<L;++l)Cache::size[l]=io.num();
-        for(auto& a:images){
-            a.layer.resize(io.num());int mx=0;
-            for(int q=0;q<(int)a.layer.size();++q){int l=a.layer[q]=io.num();a.bytes+=Cache::size[l];if(Cache::size[l]>Cache::size[a.layer[mx]])mx=q;}
-            int n=a.layer.size();if(n)a.sample={a.layer[0],a.layer[mx==0?n/2:mx],a.layer[n-1]};
+struct image_spec {
+    vector<int> layers; // 从底到顶的镜像层
+    i64 total_bytes; // 镜像层大小之和
+    array<int, 3> sample_layers{}; // 粗筛机器时查看的三层
+};
+
+struct input_data {
+    i64 total_bytes, longest_send_time; // 同源输入的总大小、最长串行传输耗时
+    int source_rack; // 输入源机架
+};
+
+struct job_state {
+    int job_id, workflow_index, image_id,
+        external_source_rack = -1; // 外部编号、所属工作流、镜像、外部输入机架
+    int predecessors_begin, predecessors_end, successors_begin, successors_end,
+        unfinished_predecessors; // 前驱和后继的半开区间、未完成前驱数
+    int list_position = -1, machine_id = -1,
+        start_tick; // 就绪/运行表位置、机器、输出机架、启动 tick
+    int retry_environment = -1; // 未投入工作流上次放置失败时的环境版本
+    unsigned status : 2, compatible_racks : 30; // 作业状态、已证在线可容纳的机架位集
+    i64 required_cores, required_memory, estimated_duration, external_input_bytes,
+        output_bytes; // 核数、内存、估计时长、输入大小、输出大小
+    i64 critical_tail, rough_tail, earliest_start,
+        prepare_time; // 精确尾长、含准备的预测尾长、最早起点、实际准备时长
+    vector<input_data> delivered_inputs; // 已完成前驱按实际机架累计的字节数与最长串行传输期
+    double planned_tail = -1, planned_cost; // 计划中的后继关键路径、当前作业的预估剩余费用
+    uint64_t plan_predecessors, running_predecessors; // 静态约简前驱、原前驱列表中正在运行的位集
+};
+
+struct workflow_state {
+    i64 max_unfinished_cores; // 未完成作业最大核数，负值表示完成事件后需要重算
+    int tenant_id, jobs_begin, jobs_end, deadline, grace_period, last_profitable_tick,
+        finished_jobs; // 租户、作业区间、截止、宽限、最后可收益 tick、完成数
+    int audited_finished_jobs = -1, schedule_tick; // 最后完成 tick、松弛缓存版本、预测版本
+    i64 value, critical_path, unfinished_cores; // 初始价值、审计关键路径、未完成作业的核数和
+    double estimated_work, frontier_tail, estimated_work_done, remaining_time, remaining_cost,
+        priority; // 剩余估计核时、临界路径、运行中预计核时、完工估时、预计费用、优先级
+    bool has_started; // 是否已投入资源
+    int reroute_tick = -1; // 本流程最近一次尝试救急重选的 tick
+    int preferred_rack = -1, plan_tick = -100,
+        planned_finished_jobs = -1; // 计划锚定机架、计划tick、完成状态版本
+    double plan_cost, plan_duration; // 整个未完成部分的预计费用、关键路径
+    int detailed_plan_tick = -1,
+        detailed_plan_environment = -1; // 最后完整恢复的精确规划对应 tick 与环境版本
+};
+
+struct image_hint {
+    int time_bucket = -1; // 估价对应的七 tick 规划周期
+    int machine_id; // 同时考虑拉取费与准备耗时后选中的机器
+    pull_amounts pull_estimate; // 同一台机器预计从仓库和机架拉取的字节数
+};
+
+struct transfer_estimate {
+    i64 transfer_time = -1;
+    i128 transfer_fee; // 传输耗时（负数不可达）、传输费
+};
+
+using candidate_entry = pair<double, int>; // 负优先级与作业下标，或机器粗排分与机器下标
+
+struct scheduler {
+    int total_ticks, datacenter_count, node_count, rack_count, machine_count, tenant_count,
+        layer_count, image_count, pattern_count, alarm_window,
+        link_count; // 初始化规模，含 tick 总数
+    int current_tick, commands_sent, duration_sample_count; // 当前 tick、指令数、完成样本数
+    int reroute_attempts; // 本 tick 的救急重选次数，限制最坏规模规划开销
+    int environment_version; // 会改变资源、缓存、估时或冷启动协作机会的环境版本
+    bool used_cache_investment; // 本 tick 是否已为共享镜像做过一次冷启动投资
+    bool compatibility_cache_dirty; // 本 tick 有机器故障，需要在规划前清除容量正命中
+    i64 registry_bandwidth, rack_bandwidth, network_bandwidth, registry_unit_fee, network_unit_fee,
+        max_pattern_weight; // 带宽、费用、最大告警模式权重
+    i64 min_cpu_price; // 全场最低 CPU 单价
+    double duration_ratio_sum; // 全场真实时长倍率样本和
+    vector<i64> cpu_prices; // 机房 CPU 单价
+    vector<rack_state> racks;
+    vector<machine_state> machines; // 机架和机器状态
+    vector<tenant_state> tenants;
+    vector<image_spec> images; // 租户和镜像
+    vector<pair<int, i64>> quota_history; // 配额的撤销记录
+    vector<job_state> jobs;
+    vector<workflow_state> workflows; // 按工作流连续存放的作业、工作流
+    vector<int> predecessors, successors, ready_jobs, online_machines,
+        active_workflows; // 前驱、后继、就绪表、在线机器、待更新的工作流
+    vector<i64> quota_headroom, quota_limits; // 本轮的租户路径剩余配额与总配额
+    vector<candidate_entry> job_candidates; // 候选优先级
+    double plan_stages[2][40], plan_costs[2][40]; // 规划双缓冲：当前试算和胜出方案的阶段耗时、费用
+    int plan_buffer = 0; // 正在写入的规划槽
+    using plan_snapshot =
+        array<pair<double, double>, 40>; // 单条可调度工作流的后继尾长与作业费用缓冲区
+    vector<vector<int>> machines_by_rack; // 各机架机器下标
+    vector<double> tenant_workload; // 各租户子树已接纳工作流的剩余占核时
+    array<i64, 30> rack_free_cores{}, rack_free_memory{}; // 每机架在本轮开始时的最大单机空闲资源
+    array<double, 30> rack_workload{}, inverse_rack_cores; // 机架的剩余核时、有效在线核数倒数
+    array<i64, 30> rack_online_cores{}, rack_max_cores{},
+        rack_max_memory{}; // 机架在线总核数、单机额定资源上界
+    array<int, 30> representative_machine; // 每机架的代表缓存机器，按 tick 重建
+    unordered_map<int, int> job_index_by_id{65536}; // 开放寻址表将九位作业编号映射到连续下标
+    vector<image_hint> image_hints; // 按机架与镜像缓存本轮乐观暖度
+    network_state network;
+    log_tracker logs; // 动态最短路和告警统计
+    string operation, token; // 协议关键字与临时字符串
+
+    static bool fits_machine_capacity(machine_state& machine, job_state& job) {
+        return machine.total_cores >= job.required_cores &&
+               machine.total_memory >= job.required_memory;
+    }
+
+    void initialize() {
+        total_ticks = io.read_int();
+        datacenter_count = io.read_int();
+        node_count = io.read_int();
+        rack_count = io.read_int();
+        machine_count = io.read_int();
+        tenant_count = io.read_int();
+        layer_count = io.read_int();
+        image_count = io.read_int();
+        pattern_count = io.read_int();
+        alarm_window = io.read_int();
+        link_count = io.read_int();
+        registry_bandwidth = io.read_int();
+        rack_bandwidth = io.read_int();
+        network_bandwidth = io.read_int();
+        registry_unit_fee = io.read_int();
+        network_unit_fee = io.read_int();
+        cpu_prices.resize(datacenter_count);
+        for (auto& unit_price : cpu_prices)
+            unit_price = io.read_int();
+        min_cpu_price = *min_element(cpu_prices.begin(), cpu_prices.end());
+        network.initialize(node_count, datacenter_count, rack_count);
+        racks.resize(rack_count);
+        machines.resize(machine_count);
+        tenants.resize(tenant_count);
+        images.resize(image_count);
+        for (int rack_id = 0; rack_id < rack_count; ++rack_id) {
+            racks[rack_id].datacenter_id = io.read_int();
+            network.rack_nodes[rack_id] = io.read_int();
+            racks[rack_id].cache.capacity = io.read_int();
         }
-        array<i64,9> freq;for(auto& f:freq)f=io.num();logs.init(M,W,freq);
-        for(int i=0;i<P;++i){io.word(token);i64 w=io.num();logs.pattern(token,w);maxWeight=max(maxWeight,w);}logs.build(max<i64>(8,maxWeight/6));
+        for (auto& machine : machines) {
+            machine.rack_id = io.read_int();
+            machine.free_cores = machine.total_cores = io.read_int();
+            machine.free_memory = machine.total_memory = io.read_int();
+            machine.cache.capacity = io.read_int();
+        }
+        for (int link_id = 0; link_id < link_count; ++link_id) {
+            int node_id = io.read_int(), neighbor_id = io.read_int();
+            i64 weight = io.read_int();
+            network.add_link(node_id, neighbor_id, weight);
+        }
+        for (auto& tenant : tenants) {
+            tenant.parent_id = io.read_int();
+            tenant.quota = io.read_int();
+        }
+        for (int entry = 0; entry < tenant_count; ++entry)
+            for (int node_id = entry; node_id >= 0; node_id = tenants[node_id].parent_id)
+                tenants[entry].ancestor_path.push_back(node_id);
+        for (int layer_id = 0; layer_id < layer_count; ++layer_id)
+            layer_cache::layer_sizes[layer_id] = io.read_int();
+        for (auto& image : images) {
+            image.layers.resize(io.read_int());
+            int largest_layer_index = 0;
+            for (int layer_index = 0; layer_index < (int)image.layers.size(); ++layer_index) {
+                int layer_id = image.layers[layer_index] = io.read_int();
+                image.total_bytes += layer_cache::layer_sizes[layer_id];
+                if (layer_cache::layer_sizes[layer_id] >
+                    layer_cache::layer_sizes[image.layers[largest_layer_index]])
+                    largest_layer_index = layer_index;
+            }
+            int layer_total = image.layers.size();
+            if (layer_total)
+                image.sample_layers = {
+                    image.layers[0],
+                    image.layers[largest_layer_index == 0 ? layer_total / 2 : largest_layer_index],
+                    image.layers[layer_total - 1]};
+        }
+        array<i64, 9> frequencies;
+        for (auto& frequency : frequencies)
+            frequency = io.read_int();
+        logs.initialize(machine_count, alarm_window, frequencies);
+        for (int pattern_id = 0; pattern_id < pattern_count; ++pattern_id) {
+            io.read_word(token);
+            i64 weight = io.read_int();
+            logs.add_pattern(token, weight);
+            max_pattern_weight = max(max_pattern_weight, weight);
+        }
+        logs.build_matcher(max<i64>(8, max_pattern_weight / 6));
         jobs.reserve(60000);
-        warmHints.resize(R*I);headroom.resize(K);limit.resize(K);committed.resize(K);
-        rackMachines.resize(R);for(int x=0;x<M;++x)rackMachines[machines[x].rack].push_back(x);
-        
+        image_hints.resize(rack_count * image_count);
+        quota_headroom.resize(tenant_count);
+        quota_limits.resize(tenant_count);
+        tenant_workload.resize(tenant_count);
+        machines_by_rack.resize(rack_count);
+        for (int machine_id = 0; machine_id < machine_count; ++machine_id)
+            machines_by_rack[machines[machine_id].rack_id].push_back(machine_id);
     }
-    void pushReady(int k){jobs[k].pos=ready.size();ready.push_back(k);}
-    void popReady(int k){int i=jobs[k].pos;ready[i]=ready.back();jobs[ready[i]].pos=i;ready.pop_back();jobs[k].pos=-1;}
-    void arrive(){
-        io.num();Flow f{};f.owner=io.num();f.value=io.num();f.dl=io.num();int n=io.num();
-        f.grace=max(5,(f.dl-t)/3);f.latest=min<i64>(T,(i64)f.dl+f.grace-1);
-        f.lo=jobs.size();f.hi=f.lo+n;int w=flows.size();jobs.resize(f.hi);
-        for(int k=f.lo;k<f.hi;++k){
-            auto& j=jobs[k];j.id=io.num();jid[j.id]=k;j.w=w;j.cpu=io.num();j.mem=io.num();j.e=io.num();
-            j.img=io.num();j.src=io.num();j.zin=io.num();j.zout=io.num();j.need=io.num();j.pb=pred.size();
-            for(int q=0;q<j.need;++q){int p=jid[io.num()];pred.push_back(p);++jobs[p].se;}
-            j.pe=pred.size();f.work+=(double)j.cpu*j.e;f.cores+=j.cpu;f.largest=max(f.largest,j.cpu);if(!j.need)pushReady(k);
-            if(none_of(machines.begin(),machines.end(),[&]( Machine& x){return fits(x,j);} ))f.latest=0;
+
+    void push_ready(int job_index) {
+        jobs[job_index].list_position = ready_jobs.size();
+        ready_jobs.push_back(job_index);
+    }
+
+    void pop_ready(int job_index) {
+        int position = jobs[job_index].list_position;
+        ready_jobs[position] = ready_jobs.back();
+        jobs[ready_jobs[position]].list_position = position;
+        ready_jobs.pop_back();
+        jobs[job_index].list_position = -1;
+    }
+
+    void read_workflow() {
+        io.read_int();
+        workflow_state flow{};
+        flow.tenant_id = io.read_int();
+        flow.value = io.read_int();
+        flow.deadline = io.read_int();
+        int job_count = io.read_int();
+        flow.grace_period = max(5, (flow.deadline - current_tick) / 3);
+        flow.last_profitable_tick =
+            min<i64>(total_ticks, (i64)flow.deadline + flow.grace_period - 1);
+        flow.jobs_begin = jobs.size();
+        flow.jobs_end = flow.jobs_begin + job_count;
+        int workflow_index = workflows.size();
+        jobs.resize(flow.jobs_end);
+        for (int job_index = flow.jobs_begin; job_index < flow.jobs_end; ++job_index) {
+            auto& job = jobs[job_index];
+            job.job_id = io.read_int();
+            job_index_by_id[job.job_id] = job_index;
+            job.workflow_index = workflow_index;
+            job.required_cores = io.read_int();
+            job.required_memory = io.read_int();
+            job.estimated_duration = io.read_int();
+            job.image_id = io.read_int();
+            job.external_source_rack = io.read_int();
+            job.external_input_bytes = io.read_int();
+            job.output_bytes = io.read_int();
+            job.unfinished_predecessors = io.read_int();
+            job.predecessors_begin = predecessors.size();
+            for (int edge_index = 0; edge_index < job.unfinished_predecessors; ++edge_index) {
+                int predecessor_index = job_index_by_id[io.read_int()];
+                predecessors.push_back(predecessor_index);
+                ++jobs[predecessor_index].successors_end;
+            }
+            job.predecessors_end = predecessors.size();
+            flow.estimated_work += (double)job.required_cores * job.estimated_duration;
+            flow.unfinished_cores += job.required_cores;
+            flow.max_unfinished_cores = max(flow.max_unfinished_cores, job.required_cores);
+            if (!job.unfinished_predecessors)
+                push_ready(job_index);
+            if (none_of(machines.begin(), machines.end(), [&](machine_state& machine) {
+                    return fits_machine_capacity(machine, job);
+                }))
+                flow.last_profitable_tick = 0;
         }
-        int total=succ.size();
-        for(int k=f.lo;k<f.hi;++k){auto& j=jobs[k];total+=j.se;j.sb=j.se=total;}
-        succ.resize(total);
-        for(int k=f.hi;k-->f.lo;){
-            auto& j=jobs[k];j.tail+=j.e;j.rough+=j.e+1;
-            for(int q=j.pb;q<j.pe;++q){auto& p=jobs[pred[q]];int a=--p.sb;succ[a]=k;p.tail=max(p.tail,j.tail);p.rough=max(p.rough,j.rough);}
+        int total = successors.size();
+        for (int job_index = flow.jobs_begin; job_index < flow.jobs_end; ++job_index) {
+            auto& job = jobs[job_index];
+            total += job.successors_end;
+            job.successors_begin = job.successors_end = total;
         }
-        if(n<=40){
+        successors.resize(total);
+        for (int job_index = flow.jobs_end; job_index-- > flow.jobs_begin;) {
+            auto& job = jobs[job_index];
+            job.critical_tail += job.estimated_duration;
+            job.rough_tail += job.estimated_duration + 1;
+            for (int edge_index = job.predecessors_begin; edge_index < job.predecessors_end;
+                 ++edge_index) {
+                auto& predecessor_index = jobs[predecessors[edge_index]];
+                int position = --predecessor_index.successors_begin;
+                successors[position] = job_index;
+                predecessor_index.critical_tail =
+                    max(predecessor_index.critical_tail, job.critical_tail);
+                predecessor_index.rough_tail = max(predecessor_index.rough_tail, job.rough_tail);
+            }
+        }
+        if (job_count <= 40) {
             uint64_t ancestors[40]{};
-            for(int k=f.lo;k<f.hi;++k){
-                auto& j=jobs[k];uint64_t mask=0;
-                for(int q=j.pb;q<j.pe;++q){int p=pred[q]-f.lo;mask|=1ULL<<p;ancestors[k-f.lo]|=ancestors[p]|(1ULL<<p);}
-                while(mask){int p=63-__builtin_clzll(mask);j.planPred|=1ULL<<p;mask&=~(ancestors[p]|(1ULL<<p));}
+            for (int job_index = flow.jobs_begin; job_index < flow.jobs_end; ++job_index) {
+                auto& job = jobs[job_index];
+                uint64_t pending_predecessors = 0;
+                for (int edge_index = job.predecessors_begin; edge_index < job.predecessors_end;
+                     ++edge_index) {
+                    int predecessor_index = predecessors[edge_index] - flow.jobs_begin;
+                    pending_predecessors |= 1ULL << predecessor_index;
+                    ancestors[job_index - flow.jobs_begin] |=
+                        ancestors[predecessor_index] | (1ULL << predecessor_index);
+                }
+                while (pending_predecessors) {
+                    int predecessor_index = 63 - __builtin_clzll(pending_predecessors);
+                    job.plan_predecessors |= 1ULL << predecessor_index;
+                    pending_predecessors &=
+                        ~(ancestors[predecessor_index] | (1ULL << predecessor_index));
+                }
             }
         }
-        flows.push_back(f);
+        workflows.push_back(flow);
     }
-    i64 head(int o){
-        i64 ans=LLONG_MAX;for(int u:tenants[o].path)ans=min(ans,tenants[u].quota-tenants[u].used);return ans;
+
+    i64 remaining_quota(int tenant_id) {
+        i64 remaining = LLONG_MAX;
+        for (int ancestor_id : tenants[tenant_id].ancestor_path)
+            remaining =
+                min(remaining, tenants[ancestor_id].quota - tenants[ancestor_id].used_cores);
+        return remaining;
     }
-    void account( Job& j,int x,int sign,i128 immediate=0){
-        i128 r=(i128)j.cpu*price[racks[machines[x].rack].dc]*sign;
-        for(int u:tenants[flows[j.w].owner].path){
-            auto& a=tenants[u];a.used+=j.cpu*sign;a.rate+=r;a.bill+=immediate-r*t;
+
+    void update_account(job_state& job, int machine_id, int sign, i128 immediate = 0) {
+        i128 rate_change = (i128)job.required_cores *
+                           cpu_prices[racks[machines[machine_id].rack_id].datacenter_id] * sign;
+        for (int ancestor_id : tenants[workflows[job.workflow_index].tenant_id].ancestor_path) {
+            auto& tenant = tenants[ancestor_id];
+            tenant.used_cores += job.required_cores * sign;
+            tenant.billing_rate += rate_change;
+            tenant.bill_offset += immediate - rate_change * current_tick;
         }
     }
-    void mark(int k){
-        for(int q=jobs[k].sb;q<jobs[k].se;++q){auto& a=jobs[succ[q]];if(a.pe-a.pb<=40)a.knownPred^=1ULL<<(find(pred.begin()+a.pb,pred.begin()+a.pe,k)-pred.begin()-a.pb);}
-    }
-    void release(int k,bool done){
-        mark(k);
-        auto& j=jobs[k];auto& x=machines[j.x];auto& f=flows[j.w];
-        account(j,j.x,-1);x.cpu+=j.cpu;x.mem+=j.mem;
-        x.run[j.pos]=x.run.back();jobs[x.run[j.pos]].pos=j.pos;x.run.pop_back();
-        j.pos=j.x=-1;
-        if(!done){j.state=0;pushReady(k);return;}
-        j.state=2;++f.finished;f.work-=(double)j.cpu*j.e;f.cores-=j.cpu;if(j.cpu==f.largest)f.largest=-1;
-        if(j.e){
-            double ratio=clamp((t-j.start-j.prep)/(double)j.e,.25,4.);
-            auto& a=tenants[f.owner];a.observed+=ratio;++a.seen;observed+=ratio;++seen;
+
+    void update_running_predecessors(int job_index) {
+        for (int edge_index = jobs[job_index].successors_begin;
+             edge_index < jobs[job_index].successors_end; ++edge_index) {
+            auto& successor = jobs[successors[edge_index]];
+            if (successor.predecessors_end - successor.predecessors_begin <= 40)
+                successor.running_predecessors ^=
+                    1ULL << (find(predecessors.begin() + successor.predecessors_begin,
+                                  predecessors.begin() + successor.predecessors_end, job_index) -
+                             predecessors.begin() - successor.predecessors_begin);
         }
-        i64 serial=divup(j.zout,Bnet);
-        for(int q=j.sb;q<j.se;++q){
-            int v=succ[q];auto& next=jobs[v];
+    }
+
+    void release_job(int job_index, bool done) {
+        update_running_predecessors(job_index);
+        auto& job = jobs[job_index];
+        auto& machine = machines[job.machine_id];
+        auto& flow = workflows[job.workflow_index];
+        update_account(job, job.machine_id, -1);
+        machine.free_cores += job.required_cores;
+        machine.free_memory += job.required_memory;
+        machine.running_jobs[job.list_position] = machine.running_jobs.back();
+        jobs[machine.running_jobs[job.list_position]].list_position = job.list_position;
+        machine.running_jobs.pop_back();
+        job.list_position = job.machine_id = -1;
+        if (!done) {
+            job.status = 0;
+            push_ready(job_index);
+            return;
+        }
+        job.status = 2;
+        ++flow.finished_jobs;
+        flow.estimated_work -= (double)job.required_cores * job.estimated_duration;
+        flow.unfinished_cores -= job.required_cores;
+        if (job.required_cores == flow.max_unfinished_cores)
+            flow.max_unfinished_cores = -1;
+        if (job.estimated_duration) {
+            double ratio = clamp((current_tick - job.start_tick - job.prepare_time) /
+                                     (double)job.estimated_duration,
+                                 .25, 4.);
+            auto& tenant = tenants[flow.tenant_id];
+            tenant.duration_ratio_sum += ratio;
+            ++tenant.sample_count;
+            duration_ratio_sum += ratio;
+            ++duration_sample_count;
+        }
+        i64 send_time = ceil_div(job.output_bytes, network_bandwidth);
+        for (int edge_index = job.successors_begin; edge_index < job.successors_end; ++edge_index) {
+            int successor_index = successors[edge_index];
+            auto& next = jobs[successor_index];
             {
-                auto& inputs=next.delivered;
-                auto it=find_if(inputs.begin(),inputs.end(),[&]( Input& a){return a.rack==x.rack;});
-                if(it==inputs.end())inputs.push_back({j.zout,serial,x.rack});
-                else{it->bytes+=j.zout;it->serial=max(it->serial,serial);}
+                auto& inputs = next.delivered_inputs;
+                auto input_position =
+                    find_if(inputs.begin(), inputs.end(), [&](input_data& tenant) {
+                        return tenant.source_rack == machine.rack_id;
+                    });
+                if (input_position == inputs.end())
+                    inputs.push_back({job.output_bytes, send_time, machine.rack_id});
+                else {
+                    input_position->total_bytes += job.output_bytes;
+                    input_position->longest_send_time =
+                        max(input_position->longest_send_time, send_time);
+                }
             }
-            if(!--next.need)pushReady(v);
+            if (!--next.unfinished_predecessors)
+                push_ready(successor_index);
         }
-        vector<Input>().swap(j.delivered);
+        vector<input_data>().swap(job.delivered_inputs);
     }
-    i64 slack(int k){
-        auto& j=jobs[k];if(j.state==2)return 0;auto& f=flows[j.w];
-        if(f.audited!=f.finished){
-            f.audited=f.finished;f.cp=0;
-            for(int u=f.lo;u<f.hi;++u){
-                auto& a=jobs[u];if(a.state==2)continue;a.es=0;
-                for(int q=a.pb;q<a.pe;++q){auto& p=jobs[pred[q]];if(p.state!=2)a.es=max(a.es,p.es+p.e);}
-                f.cp=max(f.cp,a.tail);
+
+    i64 job_slack(int job_index) {
+        auto& job = jobs[job_index];
+        if (job.status == 2)
+            return 0;
+        auto& flow = workflows[job.workflow_index];
+        if (flow.audited_finished_jobs != flow.finished_jobs) {
+            flow.audited_finished_jobs = flow.finished_jobs;
+            flow.critical_path = 0;
+            for (int job_cursor = flow.jobs_begin; job_cursor < flow.jobs_end; ++job_cursor) {
+                auto& current_job = jobs[job_cursor];
+                if (current_job.status == 2)
+                    continue;
+                current_job.earliest_start = 0;
+                for (int edge_index = current_job.predecessors_begin;
+                     edge_index < current_job.predecessors_end; ++edge_index) {
+                    auto& predecessor = jobs[predecessors[edge_index]];
+                    if (predecessor.status != 2)
+                        current_job.earliest_start =
+                            max(current_job.earliest_start,
+                                predecessor.earliest_start + predecessor.estimated_duration);
+                }
+                flow.critical_path = max(flow.critical_path, current_job.critical_tail);
             }
         }
-        return f.cp-j.es-j.tail;
+        return flow.critical_path - job.earliest_start - job.critical_tail;
     }
-    void event(){
-        io.word(op);
-        if(op!="LOG")++environment;
-        if(op=="WF"){arrive();return;}
-        int a=io.num();
-        if(op=="DONE")release(jid[a],1);
-        else if(op=="FAIL"||op=="UP"){
-            auto& x=machines[a];x.up=op=="UP";x.cache.clear();
-            if(!x.up){fitDirty=1;x.lastFail=t;x.alert=-100;while(!x.run.empty())release(x.run.back(),0);}
-        }else if(op=="DCDOWN"||op=="DCUP"){net.setDC(a,op=="DCUP");}
-        else if(op=="LDOWN"||op=="LUP"){net.setLink(a,op=="LUP");}
-        else if(op=="QUOTA"){undo.emplace_back(a,tenants[a].quota);tenants[a].quota=io.num();}
-        else if(op=="UNDO"){while(a--){auto [u,q]=undo.back();undo.pop_back();tenants[u].quota=q;}}
-        else{
-            int b=io.num();io.word(token);
-            if(logs.add(a,b,token))machines[a].alert=t;
+
+    void handle_event() {
+        io.read_word(operation);
+        if (operation != "LOG")
+            ++environment_version;
+        if (operation == "WF") {
+            read_workflow();
+            return;
         }
-    }
-    void answers(int n){
-        io.out+="ANS";
-        while(n--){
-            io.word(op);int a=io.num();i128 x=0;
-            if(op=="BILL")x=tenants[a].bill+tenants[a].rate*t;
-            else if(op=="HEAD")x=head(a);
-            else if(op=="ROUTE")x=net.dist(a,io.num());
-            else if(op=="ALARM")x=logs.value[a];
-            else if(op=="SLACK")x=slack(jid[a]);
-            else if(op=="CACHE")x=machines[a].cache.used;
-            else x=racks[a].cache.used;
-            io.out+=' ';io.put(x);
-        }
-        io.out+='\n';
-    }
-    void command(const char* name,int id,int x=-1){
-        io.out+=name;io.put(id);if(x>=0){io.out+=' ';io.put(x);}io.out+='\n';++commands;
-    }
-    double reward( Flow& f,double time){
-        if(time>T)return 0;
-        return (double)f.value*clamp((f.dl+double(f.grace)-time)/f.grace,0.,1.);
-    }
-    double payoff( Flow& f,double length){
-        return .72*reward(f,t+length)+.28*reward(f,t+max(1.,.77*length));
-    }
-    static double after( Job& j,double bias){return j.future>=0?j.future:(j.tail-j.e)*bias+(j.rough-j.tail-1);}
-    double duration( Job& j){
-        double d=max(1.,j.e*tenants[flows[j.w].owner].bias);
-        if(j.state!=1)return d;
-        double elapsed=t-j.start-j.prep;
-        return elapsed<0?d-elapsed:max({1.,d-elapsed,.25*d});
-    }
-    double debt( Flow& f){return f.work*tenants[f.owner].bias+f.cores;}
-    i64 prepare(Pull p){return divup(p.reg,Breg)+divup(p.rack,Brack);}
-    void exchange( Flow& f,Snapshot& s){
-        for(int k=f.lo;k<f.hi;++k){swap(jobs[k].future,s[k-f.lo].first);swap(jobs[k].charge,s[k-f.lo].second);}
-    }
-    void planTails( Flow& f){
-            for(int k=f.lo;k<f.hi;++k)jobs[k].future=0;
-            for(int k=f.hi;k-->f.lo;){
-                auto& j=jobs[k];j.charge=charges[scratch][k-f.lo];
-                for(uint64_t mask=j.planPred;mask;mask&=mask-1){auto& p=jobs[f.lo+__builtin_ctzll(mask)];p.future=max(p.future,stage[scratch][k-f.lo]+j.future);}
+        int event_id = io.read_int();
+        if (operation == "DONE")
+            release_job(job_index_by_id[event_id], 1);
+        else if (operation == "FAIL" || operation == "UP") {
+            auto& machine = machines[event_id];
+            machine.online = operation == "UP";
+            machine.cache.clear();
+            if (!machine.online) {
+                compatibility_cache_dirty = 1;
+                machine.last_failure_tick = current_tick;
+                machine.last_alert_tick = -100;
+                while (!machine.running_jobs.empty())
+                    release_job(machine.running_jobs.back(), 0);
             }
+        } else if (operation == "DCDOWN" || operation == "DCUP") {
+            network.set_datacenter_online(event_id, operation == "DCUP");
+        } else if (operation == "LDOWN" || operation == "LUP") {
+            network.set_link_online(event_id, operation == "LUP");
+        } else if (operation == "QUOTA") {
+            quota_history.emplace_back(event_id, tenants[event_id].quota);
+            tenants[event_id].quota = io.read_int();
+        } else if (operation == "UNDO") {
+            while (event_id--) {
+                auto [tenant_id, old_quota] = quota_history.back();
+                quota_history.pop_back();
+                tenants[tenant_id].quota = old_quota;
+            }
+        } else {
+            int bit_count = io.read_int();
+            io.read_word(token);
+            if (logs.add_log(event_id, bit_count, token))
+                machines[event_id].last_alert_tick = current_tick;
+        }
     }
-    bool plan(Flow& f,int r,bool needTails=1,int machine=-1){
-        if(machine<0)machine=representative[r];
-        if(machine<0||!net.online[net.node[r]])return 0;
-        Cache mc=machines[machine].cache,rc=racks[r].cache;
+
+    void answer_queries(int query_count) {
+        io.output_buffer += "ANS";
+        while (query_count--) {
+            io.read_word(operation);
+            int query_id = io.read_int();
+            i128 answer = 0;
+            if (operation == "BILL")
+                answer =
+                    tenants[query_id].bill_offset + tenants[query_id].billing_rate * current_tick;
+            else if (operation == "HEAD")
+                answer = remaining_quota(query_id);
+            else if (operation == "ROUTE")
+                answer = network.distance(query_id, io.read_int());
+            else if (operation == "ALARM")
+                answer = logs.alarm_scores[query_id];
+            else if (operation == "SLACK")
+                answer = job_slack(job_index_by_id[query_id]);
+            else if (operation == "CACHE")
+                answer = machines[query_id].cache.used_bytes;
+            else
+                answer = racks[query_id].cache.used_bytes;
+            io.output_buffer += ' ';
+            io.write_int(answer);
+        }
+        io.output_buffer += '\n';
+    }
+
+    void emit_command(const char* name, int id, int machine_id = -1) {
+        io.output_buffer += name;
+        io.write_int(id);
+        if (machine_id >= 0) {
+            io.output_buffer += ' ';
+            io.write_int(machine_id);
+        }
+        io.output_buffer += '\n';
+        ++commands_sent;
+    }
+
+    double reward_at(workflow_state& flow, double finish_time) {
+        if (finish_time > total_ticks)
+            return 0;
+        return (double)flow.value *
+               clamp((flow.deadline + double(flow.grace_period) - finish_time) / flow.grace_period,
+                     0., 1.);
+    }
+
+    double estimate_reward(workflow_state& flow, double elapsed_time) {
+        return .72 * reward_at(flow, current_tick + elapsed_time) +
+               .28 * reward_at(flow, current_tick + max(1., .77 * elapsed_time));
+    }
+
+    static double estimate_tail(job_state& job, double duration_factor) {
+        return job.planned_tail >= 0
+                   ? job.planned_tail
+                   : (job.critical_tail - job.estimated_duration) * duration_factor +
+                         (job.rough_tail - job.critical_tail - 1);
+    }
+
+    double estimate_duration(job_state& job) {
+        double duration =
+            max(1., job.estimated_duration *
+                        tenants[workflows[job.workflow_index].tenant_id].duration_factor);
+        if (job.status != 1)
+            return duration;
+        double elapsed = current_tick - job.start_tick - job.prepare_time;
+        return elapsed < 0 ? duration - elapsed : max({1., duration - elapsed, .25 * duration});
+    }
+
+    double estimate_remaining_work(workflow_state& flow) {
+        return flow.estimated_work * tenants[flow.tenant_id].duration_factor +
+               flow.unfinished_cores;
+    }
+
+    i64 image_prepare_time(pull_amounts amounts) {
+        return ceil_div(amounts.registry_bytes, registry_bandwidth) +
+               ceil_div(amounts.rack_bytes, rack_bandwidth);
+    }
+
+    void swap_plan_snapshot(workflow_state& flow, plan_snapshot& snapshot) {
+        for (int job_index = flow.jobs_begin; job_index < flow.jobs_end; ++job_index) {
+            swap(jobs[job_index].planned_tail, snapshot[job_index - flow.jobs_begin].first);
+            swap(jobs[job_index].planned_cost, snapshot[job_index - flow.jobs_begin].second);
+        }
+    }
+
+    void update_plan_tails(workflow_state& flow) {
+        for (int job_index = flow.jobs_begin; job_index < flow.jobs_end; ++job_index)
+            jobs[job_index].planned_tail = 0;
+        for (int job_index = flow.jobs_end; job_index-- > flow.jobs_begin;) {
+            auto& job = jobs[job_index];
+            job.planned_cost = plan_costs[plan_buffer][job_index - flow.jobs_begin];
+            for (uint64_t mask = job.plan_predecessors; mask; mask &= mask - 1) {
+                auto& predecessor = jobs[flow.jobs_begin + __builtin_ctzll(mask)];
+                predecessor.planned_tail =
+                    max(predecessor.planned_tail,
+                        plan_stages[plan_buffer][job_index - flow.jobs_begin] + job.planned_tail);
+            }
+        }
+    }
+
+    bool plan_on_rack(workflow_state& flow, int rack_id, bool calculate_tails = 1,
+                      int machine = -1) {
+        if (machine < 0)
+            machine = representative_machine[rack_id];
+        if (machine < 0 || !network.node_online[network.rack_nodes[rack_id]])
+            return 0;
+        layer_cache machine_cache = machines[machine].cache, rack_cache = racks[rack_id].cache;
         double finish[40];
-        double span=0,cost=0,work=0,unit=price[racks[r].dc];int lastImage=-1;
-        for(int k=f.lo;k<f.hi;++k){
-            int at=k-f.lo;auto& j=jobs[k];double& phase=stage[scratch][at];
-            finish[at]=phase=charges[scratch][at]=0;if(j.state==2)continue;
-            double d=duration(j),prep=0,charge=0,begin=0;
-            if(j.state==1){
-                finish[at]=phase=d;charge=d*j.cpu*price[racks[machines[j.x].rack].dc];
-            }else{
-                if(!(j.fit>>r&1)){if(none_of(rackMachines[r].begin(),rackMachines[r].end(),[&](int x){return machines[x].up&&fits(machines[x],j);} ))return 0;j.fit|=1u<<r;}
-                double transfer=0;
-                auto input=[&](int source,i64 z){
-                    if(source==r)return 1;
-                    i64 distance=net.dist(source,r);if(distance<0)return 0;
-                    prep=max(prep,(double)(distance+divup(z,Bnet)));transfer+=(double)z*distance*Unet;return 1;
+        double span = 0, cost = 0, work = 0, unit = cpu_prices[racks[rack_id].datacenter_id];
+        int last_image_id = -1;
+        for (int job_index = flow.jobs_begin; job_index < flow.jobs_end; ++job_index) {
+            int job_offset = job_index - flow.jobs_begin;
+            auto& job = jobs[job_index];
+            double& phase = plan_stages[plan_buffer][job_offset];
+            finish[job_offset] = phase = plan_costs[plan_buffer][job_offset] = 0;
+            if (job.status == 2)
+                continue;
+            double duration = estimate_duration(job), prepare_time = 0, charge = 0, begin = 0;
+            if (job.status == 1) {
+                finish[job_offset] = phase = duration;
+                charge = duration * job.required_cores *
+                         cpu_prices[racks[machines[job.machine_id].rack_id].datacenter_id];
+            } else {
+                if (!(job.compatible_racks >> rack_id & 1)) {
+                    if (none_of(machines_by_rack[rack_id].begin(), machines_by_rack[rack_id].end(),
+                                [&](int machine_id) {
+                                    return machines[machine_id].online &&
+                                           fits_machine_capacity(machines[machine_id], job);
+                                }))
+                        return 0;
+                    job.compatible_racks |= 1u << rack_id;
+                }
+                double transfer = 0;
+                auto input = [&](int source, i64 bytes) {
+                    if (source == rack_id)
+                        return 1;
+                    i64 distance = network.distance(source, rack_id);
+                    if (distance < 0)
+                        return 0;
+                    prepare_time =
+                        max(prepare_time, (double)(distance + ceil_div(bytes, network_bandwidth)));
+                    transfer += (double)bytes * distance * network_unit_fee;
+                    return 1;
                 };
-                if(j.src>=0&&!input(j.src,j.zin))return 0;
-                for( Input& in:j.delivered)if(in.rack!=r){
-                    i64 distance=net.dist(in.rack,r);if(distance<0)return 0;
-                    prep=max(prep,(double)(distance+in.serial));transfer+=(double)in.bytes*distance*Unet;
+                if (job.external_source_rack >= 0 &&
+                    !input(job.external_source_rack, job.external_input_bytes))
+                    return 0;
+                for (input_data& input_item : job.delivered_inputs)
+                    if (input_item.source_rack != rack_id) {
+                        i64 distance = network.distance(input_item.source_rack, rack_id);
+                        if (distance < 0)
+                            return 0;
+                        prepare_time =
+                            max(prepare_time, (double)(distance + input_item.longest_send_time));
+                        transfer += (double)input_item.total_bytes * distance * network_unit_fee;
+                    }
+                for (uint64_t mask = job.plan_predecessors; mask; mask &= mask - 1)
+                    begin = max(begin, finish[__builtin_ctzll(mask)]);
+                for (uint64_t mask = job.running_predecessors; mask; mask &= mask - 1) {
+                    auto& predecessor =
+                        jobs[predecessors[job.predecessors_begin + __builtin_ctzll(mask)]];
+                    if (!input(machines[predecessor.machine_id].rack_id, predecessor.output_bytes))
+                        return 0;
                 }
-                for(uint64_t mask=j.planPred;mask;mask&=mask-1)begin=max(begin,finish[__builtin_ctzll(mask)]);
-                for(uint64_t mask=j.knownPred;mask;mask&=mask-1){
-                    auto& p=jobs[pred[j.pb+__builtin_ctzll(mask)]];
-                    if(!input(machines[p.x].rack,p.zout))return 0;
-                }
-                Pull p{};if(j.img!=lastImage)p=pull(mc,rc,images[j.img].layer);
-                lastImage=images[j.img].bytes<=mc.cap?j.img:-1;
-                if(p.reg||p.rack)prep=max(prep,(double)prepare(p));
-                charge=transfer+(double)p.reg*Ureg+(prep+d)*j.cpu*unit;
-                phase=prep+d;finish[at]=begin+phase;
+                pull_amounts amounts{};
+                if (job.image_id != last_image_id)
+                    amounts =
+                        pull_image_layers(machine_cache, rack_cache, images[job.image_id].layers);
+                last_image_id =
+                    images[job.image_id].total_bytes <= machine_cache.capacity ? job.image_id : -1;
+                if (amounts.registry_bytes || amounts.rack_bytes)
+                    prepare_time = max(prepare_time, (double)image_prepare_time(amounts));
+                charge = transfer + (double)amounts.registry_bytes * registry_unit_fee +
+                         (prepare_time + duration) * job.required_cores * unit;
+                phase = prepare_time + duration;
+                finish[job_offset] = begin + phase;
             }
-            charges[scratch][at]=charge;cost+=charge;work+=phase*j.cpu;span=max(span,finish[at]);
+            plan_costs[plan_buffer][job_offset] = charge;
+            cost += charge;
+            work += phase * job.required_cores;
+            span = max(span, finish[job_offset]);
         }
-        span=max(span,work/max<i64>(1,min(limit[f.owner],rackCores[r])));
-        double own=f.started&&r==f.anchor?debt(f):0;
-        span+=.25*max(0.,rackDebt[r]-own)/max<i64>(1,rackCores[r]);
-        f.planCost=cost;f.planSpan=span;if(needTails)planTails(f);
+        span =
+            max(span,
+                work / max<i64>(1, min(quota_limits[flow.tenant_id], rack_online_cores[rack_id])));
+        double own =
+            flow.has_started && rack_id == flow.preferred_rack ? estimate_remaining_work(flow) : 0;
+        span +=
+            .25 * max(0., rack_workload[rack_id] - own) / max<i64>(1, rack_online_cores[rack_id]);
+        flow.plan_cost = cost;
+        flow.plan_duration = span;
+        if (calculate_tails)
+            update_plan_tails(flow);
         return 1;
     }
-    void forecast(Flow& f){
-        if(f.planned>t-7&&f.planChange==f.finished&&f.anchor>=0)return;
-        i128 bytes[30]{};unsigned coarseSources=0;
-        for(int k=f.lo;k<f.hi;++k){auto& j=jobs[k];if(j.state==2)continue;
-            if(j.src>=0){coarseSources|=1u<<j.src;bytes[j.src]+=j.zin;}
-            
-            for( Input& in:j.delivered){bytes[in.rack]+=in.bytes;coarseSources|=1u<<in.rack;}
+
+    void choose_rack(workflow_state& flow) {
+        if (flow.plan_tick > current_tick - 7 && flow.planned_finished_jobs == flow.finished_jobs &&
+            flow.preferred_rack >= 0)
+            return;
+        i128 bytes[30]{};
+        unsigned source_racks = 0;
+        for (int job_index = flow.jobs_begin; job_index < flow.jobs_end; ++job_index) {
+            auto& job = jobs[job_index];
+            if (job.status == 2)
+                continue;
+            if (job.external_source_rack >= 0) {
+                source_racks |= 1u << job.external_source_rack;
+                bytes[job.external_source_rack] += job.external_input_bytes;
+            }
+
+            for (input_data& input_item : job.delivered_inputs) {
+                bytes[input_item.source_rack] += input_item.total_bytes;
+                source_racks |= 1u << input_item.source_rack;
+            }
         }
         double total[30];
-        for(unsigned mask=coarseSources;mask;mask&=mask-1){int source=__builtin_ctz(mask);total[source]=(double)bytes[source];}
-        int best=-1,oldAnchor=f.anchor;double merit=-INFINITY,bestCost=0,bestSpan=0;
-        double delayUnit=.25*f.value/max(5,f.latest-t);
-        array<pair<double,int>,30> candidates;int count=0;
-        int probe=f.lo;while(probe<f.hi&&jobs[probe].state!=0)++probe;
-        for(int r=0;r<R;++r){
-            if(probe<f.hi&&(maxCPU[r]<jobs[probe].cpu||maxMEM[r]<jobs[probe].mem))continue;
-            double key=price[racks[r].dc]*f.work*tenants[f.owner].bias;
-            if(representative[r]<0||!net.online[net.node[r]])continue;
-            double transfer=0;
-            for(unsigned mask=coarseSources&~(1u<<r);mask;mask&=mask-1){
-                int source=__builtin_ctz(mask);i64 d=net.dist(source,r);if(d<0){transfer=-1;break;}
-                transfer+=total[source]*d*Unet;
-            }
-            if(transfer<0)key=1e50;else key+=transfer;
-            if(r==f.anchor)key*=.92;
-            if(probe<f.hi){
-                auto& j=jobs[probe];auto& hint=warmHints[r*I+j.img];
-                if(hint.stamp!=t/7){
-                    hint.stamp=t/7;hint.machine=-1;
-                    double bestPull=INFINITY,unit=(double)j.cpu*price[racks[r].dc];
-                    auto& rc=racks[r].cache;
-                    for(int x:rackMachines[r]){
-                        auto& m=machines[x];if(!m.up||m.cpu<j.cpu||m.mem<j.mem)continue;
-                        Pull p{};for(int l:images[j.img].sample)if(!m.cache.has(l))(rc.has(l)?p.rack:p.reg)+=Cache::size[l];
-                        double score=(double)p.reg*Ureg+prepare(p)*unit;
-                        if(score<bestPull){bestPull=score;hint.machine=x;if(!score)break;}
-                    }
-                    hint.pull=exact(hint.machine<0?representative[r]:hint.machine,j);
+        for (unsigned mask = source_racks; mask; mask &= mask - 1) {
+            int source = __builtin_ctz(mask);
+            total[source] = (double)bytes[source];
+        }
+        int best_rack = -1, previous_rack = flow.preferred_rack;
+        double merit = -INFINITY, best_cost = 0, best_duration = 0;
+        double delay_unit = .25 * flow.value / max(5, flow.last_profitable_tick - current_tick);
+        array<pair<double, int>, 30> candidates;
+        int count = 0;
+        int probe = flow.jobs_begin;
+        while (probe < flow.jobs_end && jobs[probe].status != 0)
+            ++probe;
+        for (int rack_id = 0; rack_id < rack_count; ++rack_id) {
+            if (probe < flow.jobs_end && (rack_max_cores[rack_id] < jobs[probe].required_cores ||
+                                          rack_max_memory[rack_id] < jobs[probe].required_memory))
+                continue;
+            double key = cpu_prices[racks[rack_id].datacenter_id] * flow.estimated_work *
+                         tenants[flow.tenant_id].duration_factor;
+            if (representative_machine[rack_id] < 0 ||
+                !network.node_online[network.rack_nodes[rack_id]])
+                continue;
+            double transfer = 0;
+            for (unsigned mask = source_racks & ~(1u << rack_id); mask; mask &= mask - 1) {
+                int source = __builtin_ctz(mask);
+                i64 distance = network.distance(source, rack_id);
+                if (distance < 0) {
+                    transfer = -1;
+                    break;
                 }
-                key+=(double)hint.pull.reg*Ureg+(double)prepare(hint.pull)*j.cpu*price[racks[r].dc];
+                transfer += total[source] * distance * network_unit_fee;
             }
-            if(!f.started)key+=min(.1*key,delayUnit*rackDebt[r]*inverseCores[r]);
-            candidates[count++]={key,r};
-        }
-        partial_sort(candidates.begin(),candidates.begin()+min(4,count),candidates.begin()+count);
-        for(int i=0;i<min(4,count);++i){
-            int r=candidates[i].second;
-            int machine=-1;
-            if(!f.started&&probe<f.hi){
-                auto& j=jobs[probe];int x=warmHints[r*I+j.img].machine;
-                if(x>=0&&machines[x].up&&machines[x].cpu>=j.cpu&&machines[x].mem>=j.mem)machine=x;
+            if (transfer < 0)
+                key = 1e50;
+            else
+                key += transfer;
+            if (rack_id == flow.preferred_rack)
+                key *= .92;
+            if (probe < flow.jobs_end) {
+                auto& job = jobs[probe];
+                auto& hint = image_hints[rack_id * image_count + job.image_id];
+                if (hint.time_bucket != current_tick / 7) {
+                    hint.time_bucket = current_tick / 7;
+                    hint.machine_id = -1;
+                    double best_pull_score = INFINITY,
+                           unit = (double)job.required_cores *
+                                  cpu_prices[racks[rack_id].datacenter_id];
+                    auto& rack_cache = racks[rack_id].cache;
+                    for (int machine_id : machines_by_rack[rack_id]) {
+                        auto& machine = machines[machine_id];
+                        if (!machine.online || machine.free_cores < job.required_cores ||
+                            machine.free_memory < job.required_memory)
+                            continue;
+                        pull_amounts amounts{};
+                        for (int layer_id : images[job.image_id].sample_layers)
+                            if (!machine.cache.contains(layer_id))
+                                (rack_cache.contains(layer_id) ? amounts.rack_bytes
+                                                               : amounts.registry_bytes) +=
+                                    layer_cache::layer_sizes[layer_id];
+                        double score = (double)amounts.registry_bytes * registry_unit_fee +
+                                       image_prepare_time(amounts) * unit;
+                        if (score < best_pull_score) {
+                            best_pull_score = score;
+                            hint.machine_id = machine_id;
+                            if (!score)
+                                break;
+                        }
+                    }
+                    hint.pull_estimate = preview_job_image(
+                        hint.machine_id < 0 ? representative_machine[rack_id] : hint.machine_id,
+                        job);
+                }
+                key += (double)hint.pull_estimate.registry_bytes * registry_unit_fee +
+                       (double)image_prepare_time(hint.pull_estimate) * job.required_cores *
+                           cpu_prices[racks[rack_id].datacenter_id];
             }
-            if(!plan(f,r,0,machine))continue;
-            double key=payoff(f,f.planSpan)-f.planCost;
-            if(r==f.anchor)key+=.015*f.value;
-            if(key>merit){
-                merit=key;best=r;bestCost=f.planCost;bestSpan=f.planSpan;
-                scratch^=1;
+            if (!flow.has_started)
+                key += min(.1 * key,
+                           delay_unit * rack_workload[rack_id] * inverse_rack_cores[rack_id]);
+            candidates[count++] = {key, rack_id};
+        }
+        partial_sort(candidates.begin(), candidates.begin() + min(4, count),
+                     candidates.begin() + count);
+        for (int candidate_index = 0; candidate_index < min(4, count); ++candidate_index) {
+            int rack_id = candidates[candidate_index].second;
+            int machine = -1;
+            if (!flow.has_started && probe < flow.jobs_end) {
+                auto& job = jobs[probe];
+                int machine_id = image_hints[rack_id * image_count + job.image_id].machine_id;
+                if (machine_id >= 0 && machines[machine_id].online &&
+                    machines[machine_id].free_cores >= job.required_cores &&
+                    machines[machine_id].free_memory >= job.required_memory)
+                    machine = machine_id;
+            }
+            if (!plan_on_rack(flow, rack_id, 0, machine))
+                continue;
+            double key = estimate_reward(flow, flow.plan_duration) - flow.plan_cost;
+            if (rack_id == flow.preferred_rack)
+                key += .015 * flow.value;
+            if (key > merit) {
+                merit = key;
+                best_rack = rack_id;
+                best_cost = flow.plan_cost;
+                best_duration = flow.plan_duration;
+                plan_buffer ^= 1;
             }
         }
-        if(f.started&&best!=oldAnchor){
-            double own=debt(f);
-            if(oldAnchor>=0)rackDebt[oldAnchor]-=own;
-            if(best>=0)rackDebt[best]+=own;
+        if (flow.has_started && best_rack != previous_rack) {
+            double own = estimate_remaining_work(flow);
+            if (previous_rack >= 0)
+                rack_workload[previous_rack] -= own;
+            if (best_rack >= 0)
+                rack_workload[best_rack] += own;
         }
-        f.anchor=best;f.planned=t;f.planChange=f.finished;
-        if(best>=0){
-            f.planCost=bestCost;f.planSpan=bestSpan;
-            scratch^=1;planTails(f);
-            f.exactTick=t;f.exactEnvironment=environment;
+        flow.preferred_rack = best_rack;
+        flow.plan_tick = current_tick;
+        flow.planned_finished_jobs = flow.finished_jobs;
+        if (best_rack >= 0) {
+            flow.plan_cost = best_cost;
+            flow.plan_duration = best_duration;
+            plan_buffer ^= 1;
+            update_plan_tails(flow);
+            flow.detailed_plan_tick = current_tick;
+            flow.detailed_plan_environment = environment_version;
+        } else {
+            flow.plan_duration = 1e9;
+            flow.plan_cost = 1e30;
         }
-        else{f.planSpan=1e9;f.planCost=1e30;}
     }
-    void touch(Flow& f,int w){
-        if(f.stamp==t)return;
-        f.stamp=t;f.critical=f.burn=0;f.rank=0;touched.push_back(w);
+
+    void touch_workflow(workflow_state& flow, int workflow_index) {
+        if (flow.schedule_tick == current_tick)
+            return;
+        flow.schedule_tick = current_tick;
+        flow.frontier_tail = flow.estimated_work_done = 0;
+        flow.priority = 0;
+        active_workflows.push_back(workflow_index);
     }
-    Pull exact(int x, Job& j){
-        auto& m=machines[x];return preview(m.cache,racks[m.rack].cache,images[j.img].layer);
+
+    pull_amounts preview_job_image(int machine_id, job_state& job) {
+        auto& machine = machines[machine_id];
+        return preview_image_pull(machine.cache, racks[machine.rack_id].cache,
+                                  images[job.image_id].layers);
     }
-    bool sharedWarmth(int k){
-        auto& j=jobs[k];auto& a=images[j.img];
+
+    bool has_shared_image_layer(int job_index) {
+        auto& job = jobs[job_index];
+        auto& image = images[job.image_id];
         // 仅给另一条可调度工作流也能复用的冷镜像留一次入场机会。
-        for(int i=0;i<min(64,(int)queue.size());++i){
-            auto& q=jobs[queue[i].second];
-            if(q.w==j.w||q.state!=0||head(flows[q.w].owner)<q.cpu)continue;
-            auto& b=images[q.img];if(!b.bytes)continue;
-            for(int l:a.sample)for(int r:b.sample)
-                if(l==r&&Cache::size[l]>=max<i64>(1,min(a.bytes,b.bytes)/4))return 1;
+        for (int candidate_index = 0; candidate_index < min(64, (int)job_candidates.size());
+             ++candidate_index) {
+            auto& other_job = jobs[job_candidates[candidate_index].second];
+            if (other_job.workflow_index == job.workflow_index || other_job.status != 0 ||
+                remaining_quota(workflows[other_job.workflow_index].tenant_id) <
+                    other_job.required_cores)
+                continue;
+            auto& other_image = images[other_job.image_id];
+            if (!other_image.total_bytes)
+                continue;
+            for (int layer_id : image.sample_layers)
+                for (int other_layer_id : other_image.sample_layers)
+                    if (layer_id == other_layer_id &&
+                        layer_cache::layer_sizes[layer_id] >=
+                            max<i64>(1, min(image.total_bytes, other_image.total_bytes) / 4))
+                        return 1;
         }
         return 0;
     }
-    double waitJob( Job& j,int r){
-        double best=1e9;
-        for(int x:rackMachines[r]){
-            auto& m=machines[x];
-            if(!m.up||!fits(m,j))continue;
-            if(m.cpu>=j.cpu&&m.mem>=j.mem)return 0;
-            vector<pair<double,int>> releases;releases.reserve(m.run.size());
-            for(int k:m.run)releases.emplace_back(duration(jobs[k]),k);
-            sort(releases.begin(),releases.end());i64 cpu=m.cpu,mem=m.mem;
-            for(auto [when,k]:releases){cpu+=jobs[k].cpu;mem+=jobs[k].mem;if(cpu>=j.cpu&&mem>=j.mem){best=min(best,when);break;}}
+
+    double estimate_machine_wait(job_state& job, int rack_id) {
+        double best = 1e9;
+        for (int machine_id : machines_by_rack[rack_id]) {
+            auto& machine = machines[machine_id];
+            if (!machine.online || !fits_machine_capacity(machine, job))
+                continue;
+            if (machine.free_cores >= job.required_cores &&
+                machine.free_memory >= job.required_memory)
+                return 0;
+            vector<pair<double, int>> releases;
+            releases.reserve(machine.running_jobs.size());
+            for (int running_job_index : machine.running_jobs)
+                releases.emplace_back(estimate_duration(jobs[running_job_index]),
+                                      running_job_index);
+            sort(releases.begin(), releases.end());
+            i64 free_cores = machine.free_cores, free_memory = machine.free_memory;
+            for (auto [when, running_job_index] : releases) {
+                free_cores += jobs[running_job_index].required_cores;
+                free_memory += jobs[running_job_index].required_memory;
+                if (free_cores >= job.required_cores && free_memory >= job.required_memory) {
+                    best = min(best, when);
+                    break;
+                }
+            }
         }
         return best;
     }
-    bool rescue(int k){
-        auto& j=jobs[k];auto& f=flows[j.w];
-        if(!f.started||f.anchor<0||f.rescueAt==t||rescues>=8)return 0;
-        f.rescueAt=t;
-        auto room=[&](int r){
-            if(!net.online[net.node[r]])return 0;
-            for(int x:rackMachines[r])if(machines[x].up&&machines[x].cpu>=j.cpu&&machines[x].mem>=j.mem)return 1;
+
+    bool try_reroute(int job_index) {
+        auto& job = jobs[job_index];
+        auto& flow = workflows[job.workflow_index];
+        if (!flow.has_started || flow.preferred_rack < 0 || flow.reroute_tick == current_tick ||
+            reroute_attempts >= 8)
+            return 0;
+        flow.reroute_tick = current_tick;
+        auto room = [&](int rack_id) {
+            if (!network.node_online[network.rack_nodes[rack_id]])
+                return 0;
+            for (int machine_id : machines_by_rack[rack_id])
+                if (machines[machine_id].online &&
+                    machines[machine_id].free_cores >= job.required_cores &&
+                    machines[machine_id].free_memory >= job.required_memory)
+                    return 1;
             return 0;
         };
-        if(room(f.anchor))return 0;
-        ++rescues;
-        Flow saved=f;Snapshot prior{};exchange(f,prior);
-        int old=f.anchor,best=-1;double merit=max(0.,payoff(f,f.planSpan+.5*waitJob(j,old))-f.planCost)+.005*f.value;
-        for(int r=0;r<R;++r)if(r!=old&&room(r)&&plan(f,r)){
-            double key=payoff(f,f.planSpan)-f.planCost;
-            if(key>merit){merit=key;best=r;}
-        }
-        double own=debt(f);
-        if(best>=0){
-            rackDebt[old]-=own;rackDebt[best]+=own;f.anchor=best;f.exactTick=f.exactEnvironment=-1;
-            if(place(k)){f.planned=t;f.planChange=f.finished;return 1;}
-            rackDebt[old]+=own;rackDebt[best]-=own;
+        if (room(flow.preferred_rack))
+            return 0;
+        ++reroute_attempts;
+        workflow_state saved = flow;
+        plan_snapshot prior{};
+        swap_plan_snapshot(flow, prior);
+        int previous_rack = flow.preferred_rack, best_rack = -1;
+        double merit =
+            max(0., estimate_reward(flow, flow.plan_duration +
+                                              .5 * estimate_machine_wait(job, previous_rack)) -
+                        flow.plan_cost) +
+            .005 * flow.value;
+        for (int rack_id = 0; rack_id < rack_count; ++rack_id)
+            if (rack_id != previous_rack && room(rack_id) && plan_on_rack(flow, rack_id)) {
+                double key = estimate_reward(flow, flow.plan_duration) - flow.plan_cost;
+                if (key > merit) {
+                    merit = key;
+                    best_rack = rack_id;
+                }
+            }
+        double workload = estimate_remaining_work(flow);
+        if (best_rack >= 0) {
+            rack_workload[previous_rack] -= workload;
+            rack_workload[best_rack] += workload;
+            flow.preferred_rack = best_rack;
+            flow.detailed_plan_tick = flow.detailed_plan_environment = -1;
+            if (place_job(job_index)) {
+                flow.plan_tick = current_tick;
+                flow.planned_finished_jobs = flow.finished_jobs;
+                return 1;
+            }
+            rack_workload[previous_rack] += workload;
+            rack_workload[best_rack] -= workload;
         }
         // 试算可能覆盖作业预测；未真正启动时完整恢复原锚定规划。
-        f=saved;
-        exchange(f,prior);
+        flow = saved;
+        swap_plan_snapshot(flow, prior);
         return 0;
     }
-    bool place(int k){
-        auto& j=jobs[k];auto& f=flows[j.w];
-        if(f.anchor>=0&&((f.exactTick==t&&f.exactEnvironment==environment)||plan(f,f.anchor))){
-            f.exactTick=t;f.exactEnvironment=environment;f.remain=f.planSpan;f.cost=f.planCost;
+
+    bool place_job(int job_index) {
+        auto& job = jobs[job_index];
+        auto& flow = workflows[job.workflow_index];
+        if (flow.preferred_rack >= 0 && ((flow.detailed_plan_tick == current_tick &&
+                                          flow.detailed_plan_environment == environment_version) ||
+                                         plan_on_rack(flow, flow.preferred_rack))) {
+            flow.detailed_plan_tick = current_tick;
+            flow.detailed_plan_environment = environment_version;
+            flow.remaining_time = flow.plan_duration;
+            flow.remaining_cost = flow.plan_cost;
         }
-         double bias=tenants[f.owner].bias,dur=max(1.,j.e*bias);
-         double tail=after(j,bias),later=max(0.,f.cost-j.charge);
-        auto& img=images[j.img];
-        Route route[30];unsigned possible=0;
-        int end=f.anchor<0?R:f.anchor+1;
-        for(int r=max(0,f.anchor);r<end;++r){
-            if(rackCPU[r]<j.cpu||rackMEM[r]<j.mem)continue;
-            i64 delay=0;i128 fee=0;
-            for( auto& in:j.delivered)if(in.rack!=r){
-                i64 d=net.dist(in.rack,r);if(d<0){delay=-1;break;}
-                delay=max(delay,d+in.serial);fee+=(i128)in.bytes*d*Unet;
+        double duration_factor = tenants[flow.tenant_id].duration_factor,
+               duration = max(1., job.estimated_duration * duration_factor);
+        double tail = estimate_tail(job, duration_factor),
+               later = max(0., flow.remaining_cost - job.planned_cost);
+        auto& image = images[job.image_id];
+        transfer_estimate route[30];
+        unsigned possible = 0;
+        int end = flow.preferred_rack < 0 ? rack_count : flow.preferred_rack + 1;
+        for (int rack_id = max(0, flow.preferred_rack); rack_id < end; ++rack_id) {
+            if (rack_free_cores[rack_id] < job.required_cores ||
+                rack_free_memory[rack_id] < job.required_memory)
+                continue;
+            i64 delay = 0;
+            i128 fee = 0;
+            for (auto& input_item : job.delivered_inputs)
+                if (input_item.source_rack != rack_id) {
+                    i64 distance = network.distance(input_item.source_rack, rack_id);
+                    if (distance < 0) {
+                        delay = -1;
+                        break;
+                    }
+                    delay = max(delay, distance + input_item.longest_send_time);
+                    fee += (i128)input_item.total_bytes * distance * network_unit_fee;
+                }
+            if (delay >= 0 && job.external_source_rack >= 0 &&
+                job.external_source_rack != rack_id) {
+                i64 distance = network.distance(job.external_source_rack, rack_id);
+                if (distance < 0)
+                    delay = -1;
+                else {
+                    delay = max(delay,
+                                distance + ceil_div(job.external_input_bytes, network_bandwidth));
+                    fee += (i128)job.external_input_bytes * distance * network_unit_fee;
+                }
             }
-            if(delay>=0&&j.src>=0&&j.src!=r){i64 d=net.dist(j.src,r);if(d<0)delay=-1;else{delay=max(delay,d+divup(j.zin,Bnet));fee+=(i128)j.zin*d*Unet;}}
-            if(delay<0)continue;
-            possible|=1u<<r;route[r]={delay,fee};
+            if (delay < 0)
+                continue;
+            possible |= 1u << rack_id;
+            route[rack_id] = {delay, fee};
         }
-        if(!possible)return 0;
-         double horizon=f.latest-t,loss=(double)f.value/max(5,f.grace);
-         double delayPrice=.09*f.value/max(4.,horizon)+.48*loss*clamp(1.+(t+f.remain-f.dl)/6.,0.,1.);
-        auto risk=[&]( Machine& x){
-            return max(0,7-(t-x.alert))*(dur+3.)*j.cpu*(.22+.07*minPrice)
-                 + max(0,5-(t-x.lastFail))*.15*j.cpu;
+        if (!possible)
+            return 0;
+        double horizon = flow.last_profitable_tick - current_tick,
+               loss = (double)flow.value / max(5, flow.grace_period);
+        double delay_price =
+            .09 * flow.value / max(4., horizon) +
+            .48 * loss *
+                clamp(1. + (current_tick + flow.remaining_time - flow.deadline) / 6., 0., 1.);
+        auto risk = [&](machine_state& machine) {
+            return max(0, 7 - (current_tick - machine.last_alert_tick)) * (duration + 3.) *
+                       job.required_cores * (.22 + .07 * min_cpu_price) +
+                   max(0, 5 - (current_tick - machine.last_failure_tick)) * .15 *
+                       job.required_cores;
         };
-        int best=-1,warm=-1;i64 bestPrep=0;i128 bestFee=0;double bestKey=INFINITY;bool bestInvestment=0;
-        vector<int>& choices=f.anchor>=0?rackMachines[f.anchor]:live;
-        for(int id:choices){
-            auto& x=machines[id];int r=x.rack;
-            if(!x.up||!(possible>>r&1)||x.cpu<j.cpu||x.mem<j.mem)continue;
-            Pull p=exact(id,j);
-            i64 prep=max(route[r].time,prepare(p));
-            if(prep>=horizon)continue;
-            i128 fee=route[r].fee+(i128)p.reg*Ureg;
-            double run=(double)j.cpu*price[racks[r].dc]*(prep+dur),cost=(double)fee+run;
-            double key=cost+delayPrice*prep+risk(x)+.15*(x.cpu>j.cpu)+.07*(x.mem>j.mem);
-            if(key>=bestKey)continue;
-            double span=max(f.remain,prep+dur+tail);
-            double opt=max(.77*f.remain,prep+max(1.,.72*dur)+.77*tail);
-            double income=.72*reward(f,t+span)+.28*reward(f,t+opt);
-            bool investment=0;
-            if((cost>income||cost+later>income*1.03)&&!f.started&&!invested&&p.reg){
-                if(warm<0)warm=sharedWarmth(k);
-                if(warm){double allowance=.45*payoff(f,f.critical);investment=allowance>income;income=max(income,allowance);}
+        int best_machine = -1, shared_layer = -1;
+        i64 best_prepare_time = 0;
+        i128 best_fee = 0;
+        double best_score = INFINITY;
+        bool best_investment = 0;
+        vector<int>& choices =
+            flow.preferred_rack >= 0 ? machines_by_rack[flow.preferred_rack] : online_machines;
+        for (int id : choices) {
+            auto& machine = machines[id];
+            int rack_id = machine.rack_id;
+            if (!machine.online || !(possible >> rack_id & 1) ||
+                machine.free_cores < job.required_cores ||
+                machine.free_memory < job.required_memory)
+                continue;
+            pull_amounts amounts = preview_job_image(id, job);
+            i64 prepare_time = max(route[rack_id].transfer_time, image_prepare_time(amounts));
+            if (prepare_time >= horizon)
+                continue;
+            i128 fee =
+                route[rack_id].transfer_fee + (i128)amounts.registry_bytes * registry_unit_fee;
+            double run_cost = (double)job.required_cores *
+                              cpu_prices[racks[rack_id].datacenter_id] * (prepare_time + duration),
+                   cost = (double)fee + run_cost;
+            double key = cost + delay_price * prepare_time + risk(machine) +
+                         .15 * (machine.free_cores > job.required_cores) +
+                         .07 * (machine.free_memory > job.required_memory);
+            if (key >= best_score)
+                continue;
+            double span = max(flow.remaining_time, prepare_time + duration + tail);
+            double optimistic_duration =
+                max(.77 * flow.remaining_time, prepare_time + max(1., .72 * duration) + .77 * tail);
+            double income = .72 * reward_at(flow, current_tick + span) +
+                            .28 * reward_at(flow, current_tick + optimistic_duration);
+            bool investment = 0;
+            if ((cost > income || cost + later > income * 1.03) && !flow.has_started &&
+                !used_cache_investment && amounts.registry_bytes) {
+                if (shared_layer < 0)
+                    shared_layer = has_shared_image_layer(job_index);
+                if (shared_layer) {
+                    double allowance = .45 * estimate_reward(flow, flow.frontier_tail);
+                    investment = allowance > income;
+                    income = max(income, allowance);
+                }
             }
-            if(cost>income||cost+later>income*(f.started?1.12:1.03))continue;
-            key+=(f.value-income)*.76;
-            if(key<bestKey){bestKey=key;best=id;bestPrep=prep;bestFee=fee;bestInvestment=investment;}
+            if (cost > income || cost + later > income * (flow.has_started ? 1.12 : 1.03))
+                continue;
+            key += (flow.value - income) * .76;
+            if (key < best_score) {
+                best_score = key;
+                best_machine = id;
+                best_prepare_time = prepare_time;
+                best_fee = fee;
+                best_investment = investment;
+            }
         }
-        if(best<0)return 0;
-        auto& x=machines[best];pull(x.cache,racks[x.rack].cache,img.layer);
-        ++environment;
-        invested|=bestInvestment;
-        if(!f.started&&f.anchor>=0)rackDebt[f.anchor]+=debt(f);
-        popReady(k);j.pos=x.run.size();x.run.push_back(k);j.state=1;j.x=best;j.start=t;j.prep=bestPrep;
-        mark(k);x.cpu-=j.cpu;x.mem-=j.mem;f.started=1;account(j,best,1,bestFee);command("RUN ",j.id,best);return 1;
+        if (best_machine < 0)
+            return 0;
+        auto& machine = machines[best_machine];
+        pull_image_layers(machine.cache, racks[machine.rack_id].cache, image.layers);
+        ++environment_version;
+        used_cache_investment |= best_investment;
+        if (!flow.has_started && flow.preferred_rack >= 0)
+            rack_workload[flow.preferred_rack] += estimate_remaining_work(flow);
+        pop_ready(job_index);
+        job.list_position = machine.running_jobs.size();
+        machine.running_jobs.push_back(job_index);
+        job.status = 1;
+        job.machine_id = best_machine;
+        job.start_tick = current_tick;
+        job.prepare_time = best_prepare_time;
+        update_running_predecessors(job_index);
+        machine.free_cores -= job.required_cores;
+        machine.free_memory -= job.required_memory;
+        flow.has_started = 1;
+        update_account(job, best_machine, 1, best_fee);
+        emit_command("RUN ", job.job_id, best_machine);
+        return 1;
     }
-    void schedule(){
-        live.clear();touched.clear();queue.clear();rackCPU.fill(0);rackMEM.fill(0);commands=0;invested=0;
-        i64 onlineCPU=0,freeCPU=0;
-        rescues=0;committed.assign(K,0);rackDebt.fill(0);rackCores.fill(0);
-        maxCPU.fill(0);maxMEM.fill(0);representative.fill(-1);
+
+    void schedule() {
+        online_machines.clear();
+        active_workflows.clear();
+        job_candidates.clear();
+        rack_free_cores.fill(0);
+        rack_free_memory.fill(0);
+        commands_sent = 0;
+        used_cache_investment = 0;
+        i64 online_cores = 0, free_cores = 0;
+        reroute_attempts = 0;
+        tenant_workload.assign(tenant_count, 0);
+        rack_workload.fill(0);
+        rack_online_cores.fill(0);
+        rack_max_cores.fill(0);
+        rack_max_memory.fill(0);
+        representative_machine.fill(-1);
         double quality[30];
-        double global=(observed+9.6)/(seen+8.);
-        for(int o=0;o<K;++o){
-            auto& a=tenants[o];a.bias=(a.observed+4*global)/(a.seen+4.);
-            limit[o]=LLONG_MAX;for(int p:a.path)limit[o]=min(limit[o],tenants[p].quota);
+        double global = (duration_ratio_sum + 9.6) / (duration_sample_count + 8.);
+        for (int tenant_id = 0; tenant_id < tenant_count; ++tenant_id) {
+            auto& tenant = tenants[tenant_id];
+            tenant.duration_factor =
+                (tenant.duration_ratio_sum + 4 * global) / (tenant.sample_count + 4.);
+            quota_limits[tenant_id] = LLONG_MAX;
+            for (int ancestor_id : tenant.ancestor_path)
+                quota_limits[tenant_id] = min(quota_limits[tenant_id], tenants[ancestor_id].quota);
         }
-        for( Flow& f:flows)if(f.started&&f.work>0&&t<f.latest){
-            double work=debt(f);
-            for(int p:tenants[f.owner].path)committed[p]+=work;
-            if(f.anchor>=0)rackDebt[f.anchor]+=work;
-        }
-        for(int id=0;id<M;++id){
-            auto& x=machines[id];if(!x.up)continue;
-            int rack=x.rack;
-            rackCores[rack]+=x.totalCPU;
-            maxCPU[rack]=max(maxCPU[rack],x.totalCPU);maxMEM[rack]=max(maxMEM[rack],x.totalMEM);
-            double score=x.cache.cap+3*x.totalCPU+x.totalMEM;
-            if(representative[rack]<0||score>quality[rack]){quality[rack]=score;representative[rack]=id;}
-            for(size_t i=0;i<x.run.size();){
-                int k=x.run[i];auto& j=jobs[k];auto& f=flows[j.w];
-                if(t>=f.latest&&commands<LIM){command("KILL ",j.id);release(k,0);++environment;continue;}
-                ++i;onlineCPU+=j.cpu;
-                 double bias=tenants[f.owner].bias,dur=max(1.,j.e*bias);
-                double left=duration(j);
-                touch(f,j.w);f.critical=max(f.critical,left+after(j,bias));
-                f.burn+=j.cpu*max(0.,dur+1-left);
+        for (workflow_state& flow : workflows)
+            if (flow.has_started && flow.estimated_work > 0 &&
+                current_tick < flow.last_profitable_tick) {
+                double work = estimate_remaining_work(flow);
+                for (int ancestor_id : tenants[flow.tenant_id].ancestor_path)
+                    tenant_workload[ancestor_id] += work;
+                if (flow.preferred_rack >= 0)
+                    rack_workload[flow.preferred_rack] += work;
             }
-            onlineCPU+=x.cpu;freeCPU+=x.cpu;live.push_back(id);rackCPU[x.rack]=max(rackCPU[x.rack],x.cpu);rackMEM[x.rack]=max(rackMEM[x.rack],x.mem);
+        for (int id = 0; id < machine_count; ++id) {
+            auto& machine = machines[id];
+            if (!machine.online)
+                continue;
+            int rack = machine.rack_id;
+            rack_online_cores[rack] += machine.total_cores;
+            rack_max_cores[rack] = max(rack_max_cores[rack], machine.total_cores);
+            rack_max_memory[rack] = max(rack_max_memory[rack], machine.total_memory);
+            double score = machine.cache.capacity + 3 * machine.total_cores + machine.total_memory;
+            if (representative_machine[rack] < 0 || score > quality[rack]) {
+                quality[rack] = score;
+                representative_machine[rack] = id;
+            }
+            for (size_t index = 0; index < machine.running_jobs.size();) {
+                int job_index = machine.running_jobs[index];
+                auto& job = jobs[job_index];
+                auto& flow = workflows[job.workflow_index];
+                if (current_tick >= flow.last_profitable_tick && commands_sent < command_limit) {
+                    emit_command("KILL ", job.job_id);
+                    release_job(job_index, 0);
+                    ++environment_version;
+                    continue;
+                }
+                ++index;
+                online_cores += job.required_cores;
+                double duration_factor = tenants[flow.tenant_id].duration_factor,
+                       duration = max(1., job.estimated_duration * duration_factor);
+                double left = estimate_duration(job);
+                touch_workflow(flow, job.workflow_index);
+                flow.frontier_tail =
+                    max(flow.frontier_tail, left + estimate_tail(job, duration_factor));
+                flow.estimated_work_done += job.required_cores * max(0., duration + 1 - left);
+            }
+            online_cores += machine.free_cores;
+            free_cores += machine.free_cores;
+            online_machines.push_back(id);
+            rack_free_cores[machine.rack_id] =
+                max(rack_free_cores[machine.rack_id], machine.free_cores);
+            rack_free_memory[machine.rack_id] =
+                max(rack_free_memory[machine.rack_id], machine.free_memory);
         }
-        if(t==T||live.empty()||commands==LIM)return;
-        for(int r=0;r<R;++r)inverseCores[r]=1./max<i64>(1,rackCores[r]);
-        for(int o=0;o<K;++o)headroom[o]=head(o);
-        vector<i64> quickest(I,-1); // 本轮各镜像在全部在线机器上的最小拉取时间，按需计算
+        if (current_tick == total_ticks || online_machines.empty() ||
+            commands_sent == command_limit)
+            return;
+        for (int rack_id = 0; rack_id < rack_count; ++rack_id)
+            inverse_rack_cores[rack_id] = 1. / max<i64>(1, rack_online_cores[rack_id]);
+        for (int tenant_id = 0; tenant_id < tenant_count; ++tenant_id)
+            quota_headroom[tenant_id] = remaining_quota(tenant_id);
+        vector<i64> quickest(image_count, -1); // 本轮各镜像在全部在线机器上的最小拉取时间，按需计算
         // 回收已经没有收益的就绪项，并从就绪与运行前沿估计剩余关键路径。
-        for(size_t i=0;i<ready.size();){
-            int k=ready[i];auto& j=jobs[k];auto& f=flows[j.w];
-            if(t>=f.latest){popReady(k);vector<Input>().swap(j.delivered);continue;}
-            ++i;
-            if(!f.started&&j.retry==environment)continue;
-            if(j.cpu>min(freeCPU,headroom[f.owner])||f.largest>limit[f.owner])continue;
+        for (size_t index = 0; index < ready_jobs.size();) {
+            int job_index = ready_jobs[index];
+            auto& job = jobs[job_index];
+            auto& flow = workflows[job.workflow_index];
+            if (current_tick >= flow.last_profitable_tick) {
+                pop_ready(job_index);
+                vector<input_data>().swap(job.delivered_inputs);
+                continue;
+            }
+            ++index;
+            if (!flow.has_started && job.retry_environment == environment_version)
+                continue;
+            if (job.required_cores > min(free_cores, quota_headroom[flow.tenant_id]) ||
+                flow.max_unfinished_cores > quota_limits[flow.tenant_id])
+                continue;
             // 单作业仅准备镜像就无法获益时，不再进入流程规划和候选队列。
-            if(!f.started&&f.hi-f.lo==1){
-                i64& prep=quickest[j.img];
-                if(prep<0){prep=LLONG_MAX;for(int x:live){Pull p=exact(x,j);prep=min(prep,prepare(p));}}
-                if(prep>=f.latest-t){j.retry=environment;continue;}
+            if (!flow.has_started && flow.jobs_end - flow.jobs_begin == 1) {
+                i64& prepare_time = quickest[job.image_id];
+                if (prepare_time < 0) {
+                    prepare_time = LLONG_MAX;
+                    for (int machine : online_machines) {
+                        pull_amounts ancestor_id = preview_job_image(machine, job);
+                        prepare_time = min(prepare_time, image_prepare_time(ancestor_id));
+                    }
+                }
+                if (prepare_time >= flow.last_profitable_tick - current_tick) {
+                    job.retry_environment = environment_version;
+                    continue;
+                }
             }
-            touch(f,j.w);f.critical=max(f.critical,j.tail*tenants[f.owner].bias+j.rough-j.tail);
+            touch_workflow(flow, job.workflow_index);
+            flow.frontier_tail = max(flow.frontier_tail,
+                                     job.critical_tail * tenants[flow.tenant_id].duration_factor +
+                                         job.rough_tail - job.critical_tail);
         }
-        if(touched.empty())return;
-        for(int w:touched){
-            auto& f=flows[w];double bias=tenants[f.owner].bias;
-            if(f.largest<0){f.largest=0;for(int k=f.lo;k<f.hi;++k)if(jobs[k].state!=2)f.largest=max(f.largest,jobs[k].cpu);}
+        if (active_workflows.empty())
+            return;
+        for (int workflow_index : active_workflows) {
+            auto& flow = workflows[workflow_index];
+            double duration_factor = tenants[flow.tenant_id].duration_factor;
+            if (flow.max_unfinished_cores < 0) {
+                flow.max_unfinished_cores = 0;
+                for (int job_index = flow.jobs_begin; job_index < flow.jobs_end; ++job_index)
+                    if (jobs[job_index].status != 2)
+                        flow.max_unfinished_cores =
+                            max(flow.max_unfinished_cores, jobs[job_index].required_cores);
+            }
             // 配额未来可以恢复，因此只暂停整条工作流的新增投入，不永久放弃。
-            if(f.largest>limit[f.owner]||f.hi-f.lo>40)continue;
-            double work=max(0.,f.work*bias+f.cores-f.burn);
-            forecast(f);
-            f.remain=max(1.,f.planSpan-(t-f.planned));f.cost=f.planCost;
-            if(!f.started){
-                double ahead=0;for(int p:tenants[f.owner].path)ahead=max(ahead,committed[p]/max<i64>(1,min(tenants[p].quota,onlineCPU)));
-                f.remain+=.45*ahead*max(0.,1.-headroom[f.owner]*f.remain/max(1.,work));
+            if (flow.max_unfinished_cores > quota_limits[flow.tenant_id] ||
+                flow.jobs_end - flow.jobs_begin > 40)
+                continue;
+            double work = max(0., flow.estimated_work * duration_factor + flow.unfinished_cores -
+                                      flow.estimated_work_done);
+            choose_rack(flow);
+            flow.remaining_time = max(1., flow.plan_duration - (current_tick - flow.plan_tick));
+            flow.remaining_cost = flow.plan_cost;
+            if (!flow.has_started) {
+                double ahead = 0;
+                for (int ancestor_id : tenants[flow.tenant_id].ancestor_path)
+                    ahead =
+                        max(ahead, tenant_workload[ancestor_id] /
+                                       max<i64>(1, min(tenants[ancestor_id].quota, online_cores)));
+                flow.remaining_time += .45 * ahead *
+                                       max(0., 1. - quota_headroom[flow.tenant_id] *
+                                                        flow.remaining_time / max(1., work));
             }
-            double profit=payoff(f,f.remain)-f.cost;
-            if(!f.started)profit=max(profit,.15*(payoff(f,f.critical)-max(0.,f.work*bias-f.burn)*minPrice));
-            if(profit<=0)continue;
-            if(!f.started&&f.hi-f.lo>12&&(f.cost>.7*f.value||t+1.25*f.remain>min(T,f.dl)))continue;
-            double slack=max(0.,f.dl-t-f.remain),urgent=1.+2./(3.+slack);
-            double progress=f.started?1.8+1.2*f.finished/max(1,f.hi-f.lo):1.;
-            f.rank=profit*urgent*progress/(18.+.8*work+3.*f.remain);
+            double profit = estimate_reward(flow, flow.remaining_time) - flow.remaining_cost;
+            if (!flow.has_started)
+                profit = max(profit, .15 * (estimate_reward(flow, flow.frontier_tail) -
+                                            max(0., flow.estimated_work * duration_factor -
+                                                        flow.estimated_work_done) *
+                                                min_cpu_price));
+            if (profit <= 0)
+                continue;
+            if (!flow.has_started && flow.jobs_end - flow.jobs_begin > 12 &&
+                (flow.remaining_cost > .7 * flow.value ||
+                 current_tick + 1.25 * flow.remaining_time > min(total_ticks, flow.deadline)))
+                continue;
+            double slack = max(0., flow.deadline - current_tick - flow.remaining_time),
+                   urgent = 1. + 2. / (3. + slack);
+            double progress = flow.has_started ? 1.8 + 1.2 * flow.finished_jobs /
+                                                           max(1, flow.jobs_end - flow.jobs_begin)
+                                               : 1.;
+            flow.priority =
+                profit * urgent * progress / (18. + .8 * work + 3. * flow.remaining_time);
         }
-        for(int k:ready){
-            auto& j=jobs[k];auto& f=flows[j.w];
-            if(f.stamp!=t||f.rank<=0||(!f.started&&j.retry==environment)||j.cpu>min(freeCPU,headroom[f.owner]))continue;
-            double lead=(j.tail*tenants[f.owner].bias+j.rough-j.tail)/max(1.,f.critical);
-            queue.push_back({-f.rank*(.78+.22*lead),k});
+        for (int job_index : ready_jobs) {
+            auto& job = jobs[job_index];
+            auto& flow = workflows[job.workflow_index];
+            if (flow.schedule_tick != current_tick || flow.priority <= 0 ||
+                (!flow.has_started && job.retry_environment == environment_version) ||
+                job.required_cores > min(free_cores, quota_headroom[flow.tenant_id]))
+                continue;
+            double lead = (job.critical_tail * tenants[flow.tenant_id].duration_factor +
+                           job.rough_tail - job.critical_tail) /
+                          max(1., flow.frontier_tail);
+            job_candidates.push_back({-flow.priority * (.78 + .22 * lead), job_index});
         }
-        int misses=max(144,M),chunk=max(400,4*M),n=queue.size();
-        for(int lo=0;lo<n&&misses>0&&commands<LIM;lo+=chunk){
-            int hi=min(n,lo+chunk);
-            if(hi<n)nth_element(queue.begin()+lo,queue.begin()+hi,queue.end());
-            sort(queue.begin()+lo,queue.begin()+hi);
-            for(int i=lo;i<hi&&misses>0&&commands<LIM;++i){
-                int k=queue[i].second;auto& j=jobs[k]; int owner=flows[j.w].owner;
-                if(j.cpu>freeCPU||head(owner)<j.cpu)continue;
-                if(place(k)||rescue(k))freeCPU-=j.cpu;else{--misses;if(!flows[j.w].started)jobs[k].retry=environment;}
+        int misses = max(144, machine_count), chunk = max(400, 4 * machine_count),
+            candidate_count = job_candidates.size();
+        for (int batch_begin = 0;
+             batch_begin < candidate_count && misses > 0 && commands_sent < command_limit;
+             batch_begin += chunk) {
+            int batch_end = min(candidate_count, batch_begin + chunk);
+            if (batch_end < candidate_count)
+                nth_element(job_candidates.begin() + batch_begin,
+                            job_candidates.begin() + batch_end, job_candidates.end());
+            sort(job_candidates.begin() + batch_begin, job_candidates.begin() + batch_end);
+            for (int index = batch_begin;
+                 index < batch_end && misses > 0 && commands_sent < command_limit; ++index) {
+                int job_index = job_candidates[index].second;
+                auto& job = jobs[job_index];
+                int owner = workflows[job.workflow_index].tenant_id;
+                if (job.required_cores > free_cores || remaining_quota(owner) < job.required_cores)
+                    continue;
+                if (place_job(job_index) || try_reroute(job_index))
+                    free_cores -= job.required_cores;
+                else {
+                    --misses;
+                    if (!workflows[job.workflow_index].has_started)
+                        jobs[job_index].retry_environment = environment_version;
+                }
             }
-            if(hi<n&&misses>0&&commands<LIM){
-                for(int o=0;o<K;++o)headroom[o]=head(o);
-                queue.erase(remove_if(queue.begin()+hi,queue.end(),[&]( Candidate& c){
-                    auto& j=jobs[c.second];return j.cpu>min(freeCPU,headroom[flows[j.w].owner]);
-                }),queue.end());n=queue.size();
+            if (batch_end < candidate_count && misses > 0 && commands_sent < command_limit) {
+                for (int tenant_id = 0; tenant_id < tenant_count; ++tenant_id)
+                    quota_headroom[tenant_id] = remaining_quota(tenant_id);
+                job_candidates.erase(
+                    remove_if(
+                        job_candidates.begin() + batch_end, job_candidates.end(),
+                        [&](candidate_entry& candidate) {
+                            auto& job = jobs[candidate.second];
+                            return job.required_cores >
+                                   min(free_cores,
+                                       quota_headroom[workflows[job.workflow_index].tenant_id]);
+                        }),
+                    job_candidates.end());
+                candidate_count = job_candidates.size();
             }
         }
     }
-    void run(){
-        init();
-        for(int tick=1;tick<=T;++tick){
-            io.word(op);
-            t=io.num();int ne=io.num(),nq=io.num();logs.tick(t);
-            while(ne--)event();
-            if(fitDirty){for(auto& j:jobs)j.fit=0;fitDirty=0;}
-            answers(nq);schedule();io.flush();
+
+    void run() {
+        initialize();
+        for (int tick = 1; tick <= total_ticks; ++tick) {
+            io.read_word(operation);
+            current_tick = io.read_int();
+            int event_count = io.read_int(), query_count = io.read_int();
+            logs.advance_window(current_tick);
+            while (event_count--)
+                handle_event();
+            if (compatibility_cache_dirty) {
+                for (auto& job : jobs)
+                    job.compatible_racks = 0;
+                compatibility_cache_dirty = 0;
+            }
+            answer_queries(query_count);
+            schedule();
+            io.flush();
         }
     }
 };
 
-int main(){
+int main() {
 #ifdef _WIN32
-    _setmode(0,32768); // Windows 文本协议输入改用二进制模式，避免逐字节转换
+    _setmode(0, 32768); // Windows 文本协议输入改用二进制模式，避免逐字节转换
 #endif
 
-    Solver solver{};solver.run();
+    scheduler solver{};
+    solver.run();
 }
