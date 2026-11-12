@@ -1,7 +1,14 @@
 /day1/
 
-# StarRing 本轮只提交第六轮迭代记录，其余内容保留在本地。
+# StarRing 只跟踪选定的说明文档，测试和历史产物保留在本地。
 /StarRing/*
 !/StarRing/docs/
 /StarRing/docs/*
 !/StarRing/docs/第六轮迭代记录.md
+!/StarRing/docs/第六轮策略总结.md
+!/StarRing/docs/18分策略总结.md
+!/StarRing/docs/18分迭代记录.md
+!/StarRing/docs/68分策略总结.md
+!/StarRing/docs/68分迭代记录.md
+!/StarRing/docs/78分策略总结.md
+!/StarRing/docs/78分迭代记录.md
