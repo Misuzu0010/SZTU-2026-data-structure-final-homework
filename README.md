@@ -20,3 +20,12 @@
 代码在OJ上拿81分。据说可以用 Claude 系列模型做到 90 分以上，由于笔者财力有限，故不尝试。
 
 有更高分迭代结果的同学可以提 PR。如果方便，附上策略改动和同一批用例上的利润、耗时对比，方便大家复现。
+
+## 快速开始
+
+```bash
+git clone https://github.com/Misuzu0010/SZTU-2026-data-structure-final-homework.git
+cd SZTU-2026-data-structure-final-homework
+g++ -std=c++17 StarRing.cpp -o StarRing
+./StarRing
+```
